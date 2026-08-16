@@ -1,0 +1,1548 @@
+import AppKit
+import Combine
+import CommandCenterCore
+import Foundation
+
+/// Bridges the provider runner's serial callback queue to MainActor with
+/// backpressure. The runner cannot deliver exit before an earlier session/text
+/// checkpoint finishes, and at most one bounded provider event is retained.
+final class SerializedProviderEventHandoff: @unchecked Sendable {
+    private let handler: @MainActor @Sendable (ProviderStreamEvent) async -> Void
+
+    init(handler: @escaping @MainActor @Sendable (ProviderStreamEvent) async -> Void) {
+        self.handler = handler
+    }
+
+    /// Called only from ProviderProcessRunner's private serial callback queue.
+    func accept(_ event: ProviderStreamEvent) {
+        let completion = DispatchSemaphore(value: 0)
+        Task { @MainActor [handler] in
+            await handler(event)
+            completion.signal()
+        }
+        completion.wait()
+    }
+}
+
+actor ObsidianProjectionCoordinator {
+    func write(
+        vaultURL: URL,
+        sessions: [ObsidianSessionProjection]
+    ) throws -> ObsidianProjectionResult {
+        let writer = try ObsidianProjectionWriter(vaultURL: vaultURL)
+        return try writer.write(sessions: sessions)
+    }
+}
+
+@MainActor
+final class AppModel: ObservableObject {
+    private static let maximumPromptBytes = 256 * 1_024
+    private static let maximumQueuedDispatches = 16
+    private static let maximumQueuedPromptBytes = 2 * 1_048_576
+
+    struct PendingDispatch {
+        var id: UUID
+        var conversationID: UUID
+        var prompt: String
+        var provider: RuntimeProvider
+        /// Controls the provider prompt shape. Scheduling and persisted task
+        /// classification intentionally live in `classification` so an
+        /// automated read-only review is never promoted to foreground work.
+        var workflow: RuntimeWorkflow
+        var classification: WorkflowKind
+        var permission: RuntimePermission
+        var skills: [String]
+        var enqueuedAt: Date
+        var promptCheckpointed: Bool
+    }
+
+    @Published var workspaces: [Workspace] = []
+    @Published var conversations: [Conversation] = []
+    @Published var messages: [Message] = []
+    @Published var providerHealth: [ProviderHealth] = []
+    @Published var skills: [LocalSkillDescriptor] = []
+    @Published var externalSessions: [ExternalSession] = []
+    @Published var externalTranscript: [LocalTranscriptRow] = []
+    @Published var selectedSidebar: SidebarDestination = .inbox
+    @Published var selectedConversationID: UUID?
+    @Published var selectedExternalSessionID: UUID?
+    @Published var searchText = ""
+    @Published var skillSearchText = ""
+    @Published var selectedSkills: Set<String> = ["pickup-swarm", "engineering:code-review"]
+    @Published var composerText = ""
+    @Published var selectedProvider: RuntimeProvider = .codex
+    @Published var selectedWorkflow: RuntimeWorkflow = .direct
+    @Published var selectedPermission: RuntimePermission = .readOnly
+    @Published var resourceMode: ResourceMode = .balanced
+    @Published var memorySnapshot: SystemMemorySnapshot?
+    @Published var activityText = "Starting local services…"
+    @Published var alertText: String?
+    @Published var isBootstrapping = true
+    @Published var isHistoryRefreshing = false
+    @Published var isExternalTranscriptLoading = false
+    @Published var externalTranscriptWasTruncated = false
+    @Published var externalTranscriptBytesRead = 0
+    @Published var historyLastRefreshedAt: Date?
+    @Published var historyDiagnosticCount = 0
+    @Published var historyDiagnostics: [LocalHistoryDiagnostic] = []
+    @Published var historyIndexedSessionCount = 0
+    @Published var historyOmittedSessionCount = 0
+    @Published var historyLastScanDuration: TimeInterval = 0
+    @Published var obsidianVaults: [ObsidianVaultDescriptor] = []
+    @Published var connectedObsidianVaultPath: String?
+    @Published var obsidianProjectionStatus = "Not connected"
+    @Published var obsidianProjectedFileCount = 0
+
+    private let providerHealthService = ProviderHealthService()
+    private let providerRunner = ProviderProcessRunner()
+    private let skillCatalog = SkillCatalog()
+    private let historyCoordinator = LocalHistoryRefreshCoordinator()
+    private let transcriptReader = LocalTranscriptReader()
+    private let obsidianRegistry = ObsidianVaultRegistry()
+    private let obsidianProjectionCoordinator = ObsidianProjectionCoordinator()
+    private let governor = ResourceGovernor()
+    private let metrics = DarwinSystemMetrics()
+    private var store: SQLiteStore?
+    private var runningProcesses: [UUID: RunningProviderProcess] = [:]
+    private var reservedDispatches: [UUID: PendingDispatch] = [:]
+    private var queuedDispatches: [PendingDispatch] = []
+    private var queueReservations: [UUID: PendingDispatch] = [:]
+    private var preparingConversationIDs: Set<UUID> = []
+    private var pairedReviewPrimaries: Set<UUID> = []
+    private var lastAssistantText: [UUID: String] = [:]
+    private var pinnedIDs: Set<UUID> = []
+    private var cancellationRequestedIDs: Set<UUID> = []
+    private var preparingExternalSessionIDs: Set<UUID> = []
+    private var queueDrainInProgress = false
+    private var applicationIsActive = true
+    private var obsidianSelectionGeneration = 0
+    private var obsidianProjectionRequest = 0
+    private var externalTranscriptLoadGeneration = 0
+
+    private static let connectedObsidianVaultDefaultsKey = "connectedObsidianVaultPath"
+
+    init() {
+        let stored = UserDefaults.standard.stringArray(forKey: "pinnedConversationIDs") ?? []
+        pinnedIDs = Set(stored.compactMap(UUID.init(uuidString:)))
+        Task { await bootstrap() }
+    }
+
+    var selectedConversation: Conversation? {
+        guard let selectedConversationID else { return nil }
+        return conversations.first(where: { $0.id == selectedConversationID })
+    }
+
+    var selectedExternalSession: ExternalSession? {
+        guard let selectedExternalSessionID else { return nil }
+        return externalSessions.first(where: { $0.id == selectedExternalSessionID })
+    }
+
+    var selectedWorkspace: Workspace? {
+        if case .workspace(let id) = selectedSidebar {
+            return workspaces.first(where: { $0.id == id })
+        }
+        if let selectedConversation {
+            return workspaces.first(where: { $0.id == selectedConversation.workspaceID })
+        }
+        return workspaces.first
+    }
+
+    var filteredConversations: [Conversation] {
+        let scoped: [Conversation]
+        switch selectedSidebar {
+        case .inbox:
+            scoped = conversations.filter {
+                [.running, .queued, .waitingForInput, .failed].contains($0.status)
+            }
+        case .pinned:
+            scoped = conversations.filter { pinnedIDs.contains($0.id) }
+        case .ready:
+            scoped = conversations.filter { $0.status == .completed }
+        case .workspace(let id):
+            scoped = conversations.filter { $0.workspaceID == id }
+        case .history, .skills, .runtime:
+            scoped = []
+        }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return scoped
+            .filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    var filteredExternalSessions: [ExternalSession] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return externalSessions.filter {
+            query.isEmpty
+                || $0.title.localizedCaseInsensitiveContains(query)
+                || $0.preview.localizedCaseInsensitiveContains(query)
+                || ($0.workspacePath?.localizedCaseInsensitiveContains(query) ?? false)
+                || $0.provider.displayName.localizedCaseInsensitiveContains(query)
+        }.sorted { lhs, rhs in
+            if lhs.lastSeenAt != rhs.lastSeenAt { return lhs.lastSeenAt > rhs.lastSeenAt }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    var filteredSkills: [LocalSkillDescriptor] {
+        let query = skillSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return skills }
+        return skills.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || $0.summary.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var inboxCount: Int {
+        conversations.filter {
+            [.running, .queued, .waitingForInput, .failed].contains($0.status)
+        }.count
+    }
+
+    var readyCount: Int { conversations.filter { $0.status == .completed }.count }
+    var pinnedCount: Int { conversations.filter { pinnedIDs.contains($0.id) }.count }
+    var codexHistoryCount: Int { externalSessions.filter { $0.provider == .codex }.count }
+    var claudeHistoryCount: Int { externalSessions.filter { $0.provider == .claude }.count }
+    var resumableHistoryCount: Int {
+        externalSessions.filter { $0.canResume && $0.missingSince == nil }.count
+    }
+    var runningCount: Int { runningProcesses.count + reservedDispatches.count }
+    var queuedCount: Int { queuedDispatches.count + queueReservations.count }
+    var maximumWorkers: Int { governor.policy(for: resourceMode).maximumActiveJobs }
+    var isSelectedConversationRunning: Bool {
+        selectedConversationID.map { runningProcesses[$0] != nil } ?? false
+    }
+    var isSelectedConversationBusy: Bool {
+        guard let selectedConversationID else { return false }
+        return runningProcesses[selectedConversationID] != nil
+            || reservedDispatches[selectedConversationID] != nil
+            || preparingConversationIDs.contains(selectedConversationID)
+            || queuedDispatches.contains(where: { $0.conversationID == selectedConversationID })
+            || queueReservations.values.contains(where: { $0.conversationID == selectedConversationID })
+    }
+
+    var selectedExternalWorkspace: Workspace? {
+        guard let session = selectedExternalSession else { return nil }
+        return approvedWorkspace(for: session)
+    }
+
+    var canContinueSelectedExternalSession: Bool {
+        guard let session = selectedExternalSession else { return false }
+        return session.canResume
+            && session.missingSince == nil
+            && UUID(uuidString: session.providerSessionID) != nil
+            && selectedExternalWorkspace != nil
+    }
+
+    var canRunComposerCommand: Bool {
+        selectedSidebar.supportsConversationDispatch
+            && selectedConversation != nil
+            && !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isSelectedConversationBusy
+    }
+
+    var canCancelSelectedCommand: Bool {
+        selectedSidebar.supportsConversationDispatch && isSelectedConversationRunning
+    }
+
+    var selectedProjectExternalSessions: [ExternalSession] {
+        guard case .workspace(let workspaceID) = selectedSidebar,
+              let workspace = workspaces.first(where: { $0.id == workspaceID }) else { return [] }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return externalSessions.filter { session in
+            standardizedStoredPath(session.workspacePath) == workspace.rootPath
+                && (query.isEmpty
+                    || session.title.localizedCaseInsensitiveContains(query)
+                    || session.preview.localizedCaseInsensitiveContains(query)
+                    || session.provider.displayName.localizedCaseInsensitiveContains(query))
+        }.sorted { lhs, rhs in
+            if lhs.lastSeenAt != rhs.lastSeenAt { return lhs.lastSeenAt > rhs.lastSeenAt }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    var projectTaskCounts: [UUID: Int] {
+        var counts = Dictionary(uniqueKeysWithValues: workspaces.map { ($0.id, 0) })
+        for conversation in conversations {
+            counts[conversation.workspaceID, default: 0] += 1
+        }
+        let workspaceIDsByPath = Dictionary(
+            uniqueKeysWithValues: workspaces.map { ($0.rootPath, $0.id) }
+        )
+        for session in externalSessions {
+            guard let path = standardizedStoredPath(session.workspacePath),
+                  let workspaceID = workspaceIDsByPath[path] else { continue }
+            counts[workspaceID, default: 0] += 1
+        }
+        return counts
+    }
+
+    var connectedObsidianVault: ObsidianVaultDescriptor? {
+        guard let connectedObsidianVaultPath else { return nil }
+        return obsidianVaults.first(where: { $0.rootURL.path == connectedObsidianVaultPath })
+    }
+
+    func isPinned(_ id: UUID) -> Bool { pinnedIDs.contains(id) }
+
+    func togglePin(_ id: UUID) {
+        if pinnedIDs.contains(id) { pinnedIDs.remove(id) } else { pinnedIDs.insert(id) }
+        UserDefaults.standard.set(pinnedIDs.map(\.uuidString).sorted(), forKey: "pinnedConversationIDs")
+        objectWillChange.send()
+    }
+
+    func bootstrap() async {
+        defer { isBootstrapping = false }
+        do {
+            let databaseURL = try Self.databaseURL()
+            let database = try SQLiteStore(databaseURL: databaseURL)
+            store = database
+            workspaces = try await database.listWorkspaces()
+            conversations = try await database.listConversations()
+            for index in conversations.indices where [.running, .queued].contains(conversations[index].status) {
+                conversations[index].status = .waitingForInput
+                conversations[index].updatedAt = Date()
+                try await database.updateConversation(conversations[index])
+            }
+            selectedConversationID = conversations.first(where: {
+                [.running, .queued, .waitingForInput, .failed].contains($0.status)
+            })?.id
+            if let selectedConversationID {
+                messages = try await database.listRecentMessages(conversationID: selectedConversationID)
+                adoptSettings(from: selectedConversation)
+            }
+            activityText = "Local database ready"
+        } catch {
+            alertText = "Local database could not start: \(error.localizedDescription)"
+            activityText = "Database unavailable"
+        }
+
+        async let health = providerHealthService.checkAll()
+        async let catalog = skillCatalog.scan()
+        providerHealth = await health
+        skills = await catalog
+        await refreshObsidianVaults()
+        await refreshLocalHistory(reason: "launch")
+        refreshMetrics()
+        activityText = providerHealth.allSatisfy(\.isAuthenticated)
+            ? "Codex and Claude are authenticated"
+            : "A provider needs authentication"
+    }
+
+    func refreshRuntime() async {
+        async let health = providerHealthService.checkAll()
+        async let catalog = skillCatalog.scan()
+        providerHealth = await health
+        skills = await catalog
+        await refreshObsidianVaults()
+        await refreshLocalHistory(reason: "manual")
+        refreshMetrics()
+    }
+
+    func runHistoryRefreshLoop() async {
+        while !Task.isCancelled {
+            let delay: Duration = applicationIsActive ? .seconds(30) : .seconds(120)
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await refreshLocalHistory(
+                reason: applicationIsActive ? "foreground timer" : "inactive timer"
+            )
+        }
+    }
+
+    func setApplicationActive(_ isActive: Bool) {
+        applicationIsActive = isActive
+    }
+
+    func refreshLocalHistory(reason: String) async {
+        guard let store, !isHistoryRefreshing else { return }
+        isHistoryRefreshing = true
+        let previouslySelected = selectedExternalSession
+        let result = await historyCoordinator.refresh()
+        do {
+            for observation in result.observations {
+                try await store.upsertExternalSessions(observation.snapshot.sessions)
+                if observation.snapshot.authoritative {
+                    try await store.markExternalSessionsMissing(
+                        provider: observation.provider,
+                        surface: observation.surface,
+                        seenProviderSessionIDs: observation.snapshot.sessions.map(\.providerSessionID),
+                        at: result.finishedAt
+                    )
+                }
+            }
+            externalSessions = try await store.listExternalSessions(
+                includeMissing: true,
+                limit: SQLiteStore.maximumExternalSessionListCount
+            )
+            historyIndexedSessionCount = try await store.externalSessionCount(includeMissing: true)
+            historyOmittedSessionCount = max(0, historyIndexedSessionCount - externalSessions.count)
+            if conversations.isEmpty, selectedSidebar == .inbox, !externalSessions.isEmpty {
+                selectedSidebar = .history
+            }
+            historyLastRefreshedAt = result.finishedAt
+            historyLastScanDuration = max(
+                0,
+                result.finishedAt.timeIntervalSince(result.startedAt)
+            )
+            var actionableDiagnostics = result.diagnostics.filter {
+                $0.severity != .info
+            }
+            if historyOmittedSessionCount > 0 {
+                actionableDiagnostics.append(.init(
+                    severity: .warning,
+                    code: "history-ui-window-limit-reached",
+                    sourcePath: nil,
+                    detail: "\(historyOmittedSessionCount) older indexed sessions exceed the combined 10,000-session UI safety ceiling. Reduce provider history before continuing one of those older sessions."
+                ))
+            }
+            historyDiagnosticCount = actionableDiagnostics.count
+            historyDiagnostics = Array(actionableDiagnostics.prefix(12))
+            if let previouslySelected,
+               selectedExternalSessionID == previouslySelected.id,
+               let refreshed = externalSessions.first(where: { $0.id == previouslySelected.id }),
+               (refreshed.contentDigest != previouslySelected.contentDigest
+                    || refreshed.sourceModifiedAt != previouslySelected.sourceModifiedAt
+                    || refreshed.sourceByteCount != previouslySelected.sourceByteCount) {
+                await selectExternalSession(refreshed.id)
+            }
+            await projectHistoryToObsidianIfConnected()
+            activityText = "History mirrored · \(externalSessions.count) local sessions"
+        } catch {
+            alertText = "Local history index could not refresh: \(error.localizedDescription)"
+            activityText = "History mirror needs attention"
+        }
+        isHistoryRefreshing = false
+        _ = reason // Stable reason hook for future local diagnostics; never logs bodies.
+    }
+
+    func refreshObsidianVaults() async {
+        let selectionGeneration = obsidianSelectionGeneration
+        let registry = obsidianRegistry
+        let discovered = await Task.detached(priority: .utility) {
+            (try? registry.discoverVaults()) ?? []
+        }.value
+        obsidianVaults = discovered
+        guard selectionGeneration == obsidianSelectionGeneration else { return }
+        let stored = UserDefaults.standard.string(
+            forKey: Self.connectedObsidianVaultDefaultsKey
+        )
+        if let stored, discovered.contains(where: { $0.rootURL.path == stored }) {
+            connectedObsidianVaultPath = stored
+            if obsidianProjectionStatus == "Not connected" {
+                obsidianProjectionStatus = "Connected · metadata graph only"
+            }
+        } else {
+            connectedObsidianVaultPath = nil
+            if stored != nil {
+                UserDefaults.standard.removeObject(
+                    forKey: Self.connectedObsidianVaultDefaultsKey
+                )
+                obsidianProjectionStatus = "Disconnected · registered vault unavailable"
+            }
+        }
+    }
+
+    func connectObsidianVault(_ descriptor: ObsidianVaultDescriptor) async {
+        guard obsidianVaults.contains(descriptor) else {
+            alertText = "Refresh the local Obsidian vault registry before connecting."
+            return
+        }
+        obsidianSelectionGeneration &+= 1
+        connectedObsidianVaultPath = descriptor.rootURL.path
+        await projectHistoryToObsidianIfConnected()
+    }
+
+    func disconnectObsidianVault() {
+        obsidianSelectionGeneration &+= 1
+        obsidianProjectionRequest &+= 1
+        connectedObsidianVaultPath = nil
+        obsidianProjectionStatus = "Disconnected · existing Command Center notes retained"
+        obsidianProjectedFileCount = 0
+        UserDefaults.standard.removeObject(forKey: Self.connectedObsidianVaultDefaultsKey)
+    }
+
+    private func projectHistoryToObsidianIfConnected() async {
+        guard let descriptor = connectedObsidianVault else { return }
+        let selectionGeneration = obsidianSelectionGeneration
+        obsidianProjectionRequest &+= 1
+        let projectionRequest = obsidianProjectionRequest
+        let presentSessions = externalSessions
+            .filter { $0.missingSince == nil }
+            .prefix(ObsidianProjectionWriter.maximumSessions)
+        let projections = presentSessions.map { session in
+            let projectPath = session.workspacePath.map {
+                URL(fileURLWithPath: $0, isDirectory: true)
+                    .resolvingSymlinksInPath().standardizedFileURL.path
+            }
+            let projectID = projectPath.map {
+                LocalHistoryUtilities.stableSessionID(
+                    provider: .codex,
+                    sessionID: "command-center-project:\($0)"
+                )
+            }
+            let parentID = session.parentProviderSessionID.map {
+                LocalHistoryUtilities.stableSessionID(
+                    provider: session.provider,
+                    sessionID: $0
+                )
+            }
+            return ObsidianSessionProjection(
+                id: session.id,
+                providerDisplay: session.provider.displayName,
+                title: session.title,
+                status: session.statusDisplayName,
+                sourceUpdatedAt: session.lastSeenAt,
+                projectID: projectID,
+                projectName: projectPath.map {
+                    URL(fileURLWithPath: $0, isDirectory: true).lastPathComponent
+                },
+                parentID: parentID,
+                resumable: session.canResume && session.missingSince == nil
+            )
+        }
+        let vaultURL = descriptor.rootURL
+        do {
+            let result = try await obsidianProjectionCoordinator.write(
+                vaultURL: vaultURL,
+                sessions: projections
+            )
+            guard Self.projectionResultIsCurrent(
+                expectedGeneration: selectionGeneration,
+                expectedRequest: projectionRequest,
+                expectedPath: vaultURL.path,
+                currentGeneration: obsidianSelectionGeneration,
+                currentRequest: obsidianProjectionRequest,
+                currentPath: connectedObsidianVaultPath
+            ) else { return }
+            obsidianProjectedFileCount = result.writtenFiles + result.unchangedFiles
+            UserDefaults.standard.set(
+                vaultURL.path,
+                forKey: Self.connectedObsidianVaultDefaultsKey
+            )
+            let missingSuffix = result.missingSessions > 0
+                ? " · \(result.missingSessions) retained missing"
+                : ""
+            let truncatedSuffix = externalSessions.filter { $0.missingSince == nil }.count
+                > ObsidianProjectionWriter.maximumSessions
+                ? " · newest \(ObsidianProjectionWriter.maximumSessions) projected"
+                : ""
+            obsidianProjectionStatus = result.writtenFiles == 0
+                ? "Current · \(result.unchangedFiles) metadata files unchanged\(missingSuffix)\(truncatedSuffix)"
+                : "Updated · \(result.writtenFiles) metadata files written\(missingSuffix)\(truncatedSuffix)"
+        } catch {
+            guard Self.projectionResultIsCurrent(
+                expectedGeneration: selectionGeneration,
+                expectedRequest: projectionRequest,
+                expectedPath: vaultURL.path,
+                currentGeneration: obsidianSelectionGeneration,
+                currentRequest: obsidianProjectionRequest,
+                currentPath: connectedObsidianVaultPath
+            ) else { return }
+            obsidianSelectionGeneration &+= 1
+            connectedObsidianVaultPath = nil
+            UserDefaults.standard.removeObject(
+                forKey: Self.connectedObsidianVaultDefaultsKey
+            )
+            obsidianProjectionStatus = "Projection stopped · \(error.localizedDescription)"
+            alertText = "Obsidian projection could not update: \(error.localizedDescription)"
+        }
+    }
+
+    static func projectionResultIsCurrent(
+        expectedGeneration: Int,
+        expectedRequest: Int,
+        expectedPath: String,
+        currentGeneration: Int,
+        currentRequest: Int,
+        currentPath: String?
+    ) -> Bool {
+        expectedGeneration == currentGeneration
+            && expectedRequest == currentRequest
+            && expectedPath == currentPath
+    }
+
+    func refreshMetrics() {
+        memorySnapshot = try? metrics.snapshot()
+        Task { await drainQueueIfPossible() }
+    }
+
+    func chooseWorkspace() {
+        let panel = NSOpenPanel()
+        panel.title = "Add a local project"
+        panel.message = "Command Center stores only the folder path and app-owned conversation state."
+        panel.prompt = "Add Project"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in await self?.addWorkspace(url) }
+        }
+    }
+
+    func addWorkspace(_ url: URL, createTask: Bool = true) async {
+        let normalized = url.resolvingSymlinksInPath().standardizedFileURL
+        guard normalized.isFileURL,
+              (try? normalized.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+              let store else {
+            alertText = "Choose an existing local folder."
+            return
+        }
+        if let existing = workspaces.first(where: { $0.rootPath == normalized.path }) {
+            selectedSidebar = .workspace(existing.id)
+            return
+        }
+        let workspace = Workspace(name: normalized.lastPathComponent, rootPath: normalized.path)
+        do {
+            try await store.upsertWorkspace(workspace)
+            workspaces.append(workspace)
+            workspaces.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            selectedSidebar = .workspace(workspace.id)
+            if createTask { await createConversation() }
+        } catch {
+            alertText = "Project could not be added: \(error.localizedDescription)"
+        }
+    }
+
+    func approveSelectedExternalWorkspace() {
+        guard let session = selectedExternalSession,
+              let workspacePath = session.workspacePath else {
+            alertText = "This provider session has no usable local project folder."
+            return
+        }
+        let expected = URL(fileURLWithPath: workspacePath, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard expected.path != "/",
+              (try? expected.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+            alertText = "The provider’s project folder no longer exists."
+            return
+        }
+
+        let sessionID = session.id
+        let panel = NSOpenPanel()
+        panel.title = "Approve project for \(session.provider.displayName)"
+        panel.message = "Choose this exact folder to allow subscription-CLI continuation:\n\(expected.path)"
+        panel.prompt = "Approve Project"
+        panel.directoryURL = expected.deletingLastPathComponent()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.begin { [weak self] response in
+            guard response == .OK, let selected = panel.url else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                let approved = selected.resolvingSymlinksInPath().standardizedFileURL
+                guard approved.path == expected.path else {
+                    self.alertText = "Choose the exact provider project folder shown in the approval prompt."
+                    return
+                }
+                await self.addWorkspace(approved, createTask: false)
+                self.selectedSidebar = .history
+                self.selectedExternalSessionID = sessionID
+                await self.continueSelectedExternalSession()
+            }
+        }
+    }
+
+    func continueSelectedExternalSession() async {
+        guard let selectedSession = selectedExternalSession, let store else { return }
+        guard preparingExternalSessionIDs.insert(selectedSession.id).inserted else { return }
+        defer { preparingExternalSessionIDs.remove(selectedSession.id) }
+        guard UUID(uuidString: selectedSession.providerSessionID) != nil else {
+            alertText = "This provider task has an unsupported session identifier and cannot be resumed safely."
+            return
+        }
+        guard selectedSession.missingSince == nil, selectedSession.canResume else {
+            alertText = "This provider source is not currently resumable. Refresh history and verify the provider session still exists."
+            return
+        }
+        activityText = "Revalidating \(selectedSession.provider.displayName) source…"
+        let validation = await historyCoordinator.revalidate(session: selectedSession)
+        guard selectedExternalSessionID == selectedSession.id else { return }
+        guard validation.permitsResume, let refreshedSession = validation.refreshedSession else {
+            if validation.state == .unavailable {
+                do {
+                    try await store.markExternalSessionMissing(
+                        id: selectedSession.id,
+                        at: validation.checkedAt
+                    )
+                    externalSessions = try await store.listExternalSessions(
+                        includeMissing: true,
+                        limit: SQLiteStore.maximumExternalSessionListCount
+                    )
+                } catch {
+                    alertText = "The missing provider task could not be checkpointed: \(error.localizedDescription)"
+                    return
+                }
+            }
+            let detail = validation.diagnostic?.detail
+                ?? "The provider source could not be confirmed safely."
+            alertText = validation.state == .unavailable
+                ? "This provider task is no longer present locally and was marked missing."
+                : "\(detail) No provider process was started; refresh and retry."
+            activityText = "Continuation blocked safely"
+            return
+        }
+        do {
+            try await store.upsertExternalSessions([refreshedSession])
+        } catch {
+            alertText = "The revalidated provider metadata could not be checkpointed: \(error.localizedDescription)"
+            return
+        }
+        let session = (try? await store.externalSession(
+            provider: refreshedSession.provider,
+            surface: refreshedSession.surface,
+            providerSessionID: refreshedSession.providerSessionID
+        )) ?? refreshedSession
+        guard let workspace = approvedWorkspace(for: session) else {
+            alertText = "Approve this task’s exact project folder before continuing it."
+            return
+        }
+
+        if let linkedID = try? await store.conversationID(forExternalSessionID: session.id) {
+            guard selectedExternalSessionID == session.id else { return }
+            let existing: Conversation?
+            if let loaded = conversations.first(where: { $0.id == linkedID }) {
+                existing = loaded
+            } else {
+                existing = try? await store.conversation(id: linkedID)
+            }
+            guard selectedExternalSessionID == session.id else { return }
+            if let existing,
+               Self.conversationIdentityMatches(existing, session: session, workspace: workspace) {
+                if !conversations.contains(where: { $0.id == existing.id }) {
+                    conversations.insert(existing, at: 0)
+                }
+                selectedConversationID = existing.id
+                selectedSidebar = .workspace(existing.workspaceID)
+                await selectConversation(existing.id)
+                return
+            }
+
+            // Preserve the old app task, but release its stale external identity
+            // before creating a correctly typed continuation task.
+            do {
+                try await store.unlinkConversation(conversationID: linkedID)
+            } catch {
+                alertText = "The stale provider-task link could not be released: \(error.localizedDescription)"
+                return
+            }
+            guard selectedExternalSessionID == session.id else { return }
+        }
+
+        let now = Date()
+        let conversation = Conversation(
+            workspaceID: workspace.id,
+            title: session.title,
+            provider: session.provider,
+            workflow: .interactive,
+            permissionMode: .readOnly,
+            status: .idle,
+            providerSessionID: session.providerSessionID,
+            skillIDs: [],
+            createdAt: now,
+            updatedAt: max(session.lastSeenAt, now)
+        )
+        do {
+            try await store.insertConversation(conversation)
+            guard selectedExternalSessionID == session.id else {
+                try? await store.deleteConversation(id: conversation.id)
+                return
+            }
+            do {
+                try await store.linkConversation(
+                    conversationID: conversation.id,
+                    externalSessionID: session.id
+                )
+            } catch {
+                try? await store.deleteConversation(id: conversation.id)
+                throw error
+            }
+            conversations.insert(conversation, at: 0)
+            selectedConversationID = conversation.id
+            selectedSidebar = .workspace(workspace.id)
+            messages = []
+            selectedProvider = session.provider.runtimeProvider
+            selectedWorkflow = .direct
+            selectedPermission = .readOnly
+            selectedSkills = []
+            _ = await appendMessage(
+                .system,
+                content: "Existing \(session.surface.displayName) task linked locally. Provider history remains authoritative; only new turns sent here are checkpointed in Command Center.",
+                conversationID: conversation.id
+            )
+        } catch {
+            alertText = "Provider task could not be linked: \(error.localizedDescription)"
+        }
+    }
+
+    func createConversation() async {
+        guard let store else { return }
+        guard let workspace = selectedWorkspace ?? workspaces.first else {
+            chooseWorkspace()
+            return
+        }
+        let now = Date()
+        let conversation = Conversation(
+            workspaceID: workspace.id,
+            title: "New \(selectedProvider.displayName) task",
+            provider: selectedProvider.providerKind,
+            workflow: selectedWorkflow.workflowKind,
+            permissionMode: selectedPermission.permissionMode,
+            status: .idle,
+            skillIDs: Array(selectedSkills),
+            createdAt: now,
+            updatedAt: now
+        )
+        do {
+            try await store.insertConversation(conversation)
+            conversations.insert(conversation, at: 0)
+            selectedConversationID = conversation.id
+            selectedSidebar = .workspace(workspace.id)
+            messages = []
+        } catch {
+            alertText = "Task could not be created: \(error.localizedDescription)"
+        }
+    }
+
+    /// Creates an app-owned successor or read-only reviewer task. Provider
+    /// identities remain immutable: this always creates a new local task and
+    /// records the relationship in the continuity ledger.
+    func continueSelected(in provider: RuntimeProvider, reviewOnly: Bool = false) async {
+        guard let source = selectedConversation,
+              let workspace = workspaces.first(where: { $0.id == source.workspaceID }),
+              let store else { return }
+        guard source.provider.runtimeProvider != provider || reviewOnly else {
+            alertText = "Choose the other provider for a continuity handoff."
+            return
+        }
+        let now = Date()
+        do {
+            let existingProject = try await store.listContinuityProjects(workspaceID: workspace.id).first
+            let project = try existingProject ?? ContinuityProject(
+                workspaceID: workspace.id,
+                name: workspace.name,
+                summary: "Bridge-owned project continuity ledger"
+            )
+            if try await store.continuityProject(id: project.id) == nil {
+                try await store.upsertContinuityProject(project)
+            }
+            let sourceLink = try ContinuitySessionLink(
+                projectID: project.id,
+                conversationID: source.id,
+                kind: .primary,
+                createdAt: now,
+                updatedAt: now
+            )
+            try await store.upsertContinuitySessionLink(sourceLink)
+            let destination = Conversation(
+                workspaceID: workspace.id,
+                title: reviewOnly ? "Review · \(source.title)" : "Continue · \(source.title)",
+                provider: provider.providerKind,
+                workflow: reviewOnly ? .backgroundReview : .interactive,
+                permissionMode: .readOnly,
+                status: .idle,
+                skillIDs: source.skillIDs,
+                createdAt: now,
+                updatedAt: now
+            )
+            try await store.insertConversation(destination)
+            let destinationLink = try ContinuitySessionLink(
+                projectID: project.id,
+                conversationID: destination.id,
+                kind: .successor,
+                createdAt: now,
+                updatedAt: now
+            )
+            try await store.upsertContinuitySessionLink(destinationLink)
+            let handoff = try ContinuityHandoff(
+                projectID: project.id,
+                sourceSessionLinkID: sourceLink.id,
+                destinationSessionLinkID: destinationLink.id,
+                title: reviewOnly ? "Read-only review of \(source.title)" : "Compact continuation of \(source.title)",
+                summary: "Source provider: \(source.provider.displayName). Source task status: \(source.status.displayName). Continue from the validated repository state and treat provider output as advisory context.",
+                state: .ready,
+                createdAt: now,
+                updatedAt: now
+            )
+            try await store.upsertContinuityHandoff(handoff)
+            conversations.insert(destination, at: 0)
+            selectedConversationID = destination.id
+            selectedSidebar = .workspace(workspace.id)
+            messages = []
+            _ = await appendMessage(
+                .system,
+                content: reviewOnly
+                    ? "Read-only reviewer task created for \(provider.displayName). Findings are advisory and cannot write."
+                    : "Compact continuity handoff created for \(provider.displayName). Provider sessions remain separate; continue from the validated repository state.",
+                conversationID: destination.id
+            )
+            selectedProvider = provider
+            selectedWorkflow = reviewOnly ? .pairedReview : .direct
+            selectedPermission = .readOnly
+        } catch {
+            alertText = "Continuity handoff could not be created: \(error.localizedDescription)"
+        }
+    }
+
+    func selectConversation(_ id: UUID?) async {
+        selectedConversationID = id
+        guard let id, let store else {
+            messages = []
+            return
+        }
+        do {
+            let loaded = try await store.listRecentMessages(conversationID: id)
+            guard selectedConversationID == id else { return }
+            messages = loaded
+            adoptSettings(from: conversations.first(where: { $0.id == id }))
+        } catch {
+            alertText = "Conversation could not be loaded: \(error.localizedDescription)"
+        }
+    }
+
+    func selectExternalSession(_ id: UUID?) async {
+        externalTranscriptLoadGeneration &+= 1
+        let loadGeneration = externalTranscriptLoadGeneration
+        selectedExternalSessionID = id
+        externalTranscript = []
+        externalTranscriptWasTruncated = false
+        externalTranscriptBytesRead = 0
+        guard let id,
+              let session = externalSessions.first(where: { $0.id == id }),
+              session.canReadTranscript else {
+            isExternalTranscriptLoading = false
+            return
+        }
+        isExternalTranscriptLoading = true
+        let snapshot = await transcriptReader.read(
+            session: session,
+            limits: LocalTranscriptReadLimits(messageCount: 50, readBytes: 2 * 1_048_576)
+        )
+        guard selectedExternalSessionID == id,
+              externalTranscriptLoadGeneration == loadGeneration else { return }
+        externalTranscript = snapshot.rows
+        externalTranscriptWasTruncated = snapshot.wasTruncated
+        externalTranscriptBytesRead = snapshot.bytesRead
+        isExternalTranscriptLoading = false
+    }
+
+    func dispatchComposer() async {
+        guard selectedSidebar.supportsConversationDispatch else {
+            alertText = "Open an app-owned task before running a prompt. Local history, Skills, and Runtime are non-dispatch surfaces."
+            return
+        }
+        let input = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sanitized = TerminalTextSanitizer.sanitize(
+            input,
+            limits: TextSanitizationLimits(
+                maximumLineBytes: 64 * 1_024,
+                maximumMessageBytes: Self.maximumPromptBytes
+            )
+        )
+        let prompt = sanitized.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        let dispatchProvider = selectedProvider
+        let dispatchWorkflow = selectedWorkflow
+        let dispatchPermission = selectedPermission
+        let dispatchSkills = Array(selectedSkills).sorted()
+        let intendedWorkspaceID = selectedWorkspace?.id
+        guard !sanitized.messageWasTruncated, sanitized.truncatedLineCount == 0 else {
+            composerText = prompt
+            alertText = "The prompt was reduced to the 256 KiB local safety limit. Review the shortened text, then send it again."
+            return
+        }
+        if selectedConversation == nil {
+            await createConversation()
+        }
+        guard let conversation = selectedConversation,
+              intendedWorkspaceID == nil || conversation.workspaceID == intendedWorkspaceID else {
+            alertText = "The project changed while the new task was being created. Select the intended project and retry."
+            return
+        }
+        let targetConversationID = conversation.id
+        guard runningProcesses[conversation.id] == nil,
+              reservedDispatches[conversation.id] == nil,
+              !preparingConversationIDs.contains(conversation.id),
+              !queuedDispatches.contains(where: { $0.conversationID == conversation.id }),
+              !queueReservations.values.contains(where: { $0.conversationID == conversation.id }) else {
+            alertText = "This task already has active or queued work. Stop it or wait for completion before sending another turn."
+            return
+        }
+        preparingConversationIDs.insert(conversation.id)
+        defer { preparingConversationIDs.remove(conversation.id) }
+        guard await appendMessage(.user, content: prompt, conversationID: conversation.id) != nil else {
+            activityText = "Prompt checkpoint failed"
+            return
+        }
+        guard conversations.contains(where: { $0.id == targetConversationID }),
+              runningProcesses[targetConversationID] == nil,
+              reservedDispatches[targetConversationID] == nil,
+              !queuedDispatches.contains(where: { $0.conversationID == targetConversationID }),
+              !queueReservations.values.contains(where: { $0.conversationID == targetConversationID }) else {
+            alertText = "The task changed while its local checkpoint was saving. Your prompt is preserved; review the task and retry."
+            return
+        }
+        if selectedConversationID == targetConversationID,
+           composerText.trimmingCharacters(in: .whitespacesAndNewlines) == input {
+            composerText = ""
+        }
+        let pending = PendingDispatch(
+            id: UUID(),
+            conversationID: targetConversationID,
+            prompt: prompt,
+            provider: dispatchProvider,
+            workflow: dispatchWorkflow,
+            classification: dispatchWorkflow.workflowKind,
+            permission: dispatchPermission,
+            skills: dispatchSkills,
+            enqueuedAt: Date(),
+            promptCheckpointed: true
+        )
+        if dispatchWorkflow == .pairedReview {
+            pairedReviewPrimaries.insert(targetConversationID)
+        }
+        await admitOrQueue(pending)
+    }
+
+    func cancelSelected() {
+        guard selectedSidebar.supportsConversationDispatch,
+              let id = selectedConversationID,
+              let process = runningProcesses[id],
+              process.isRunning else { return }
+        cancellationRequestedIDs.insert(id)
+        process.cancel()
+        activityText = "Cancellation requested"
+    }
+
+    func shutdown() {
+        Task { await historyCoordinator.cancel() }
+        for (conversationID, process) in runningProcesses {
+            cancellationRequestedIDs.insert(conversationID)
+            process.cancel()
+        }
+    }
+
+    func clearAlert() { alertText = nil }
+
+    private func admitOrQueue(_ pending: PendingDispatch) async {
+        guard await linkedIdentityAllows(pending, revalidateSource: false) else {
+            pairedReviewPrimaries.remove(pending.conversationID)
+            activityText = "Linked provider identity protected"
+            return
+        }
+        refreshMetricsWithoutDrain()
+        let memory = memorySnapshot ?? SystemMemorySnapshot(
+            physicalBytes: ProcessInfo.processInfo.physicalMemory,
+            availableBytes: ProcessInfo.processInfo.physicalMemory,
+            appResidentBytes: 0
+        )
+        let queuedJob = QueuedJob(
+            id: pending.id,
+            conversationID: pending.conversationID,
+            provider: pending.provider.providerKind,
+            workflow: pending.classification,
+            enqueuedAt: pending.enqueuedAt
+        )
+        let plan = governor.makeAdmissionPlan(
+            queuedJobs: [queuedJob],
+            activeJobs: activeJobs(),
+            memory: memory,
+            mode: resourceMode
+        )
+        if plan.admitted.isEmpty {
+            let allQueued = queuedDispatches + Array(queueReservations.values)
+            let retainedPromptBytes = allQueued.reduce(0) { $0 + $1.prompt.utf8.count }
+            guard allQueued.count < Self.maximumQueuedDispatches,
+                  pending.prompt.utf8.count <= Self.maximumQueuedPromptBytes - retainedPromptBytes else {
+                pairedReviewPrimaries.remove(pending.conversationID)
+                await setStatus(.waitingForInput, for: pending.conversationID)
+                _ = await appendMessage(
+                    .tool,
+                    content: "Not queued: the local queue reached its bounded memory limit. Retry after active work completes.",
+                    conversationID: pending.conversationID
+                )
+                activityText = "Queue memory limit reached"
+                alertText = "The task was checkpointed but not queued because the local queue is full. Retry after active work completes."
+                return
+            }
+            var checkpointed = pending
+            queueReservations[checkpointed.id] = checkpointed
+            if !checkpointed.promptCheckpointed {
+                guard await appendMessage(
+                    .user,
+                    content: checkpointed.prompt,
+                    conversationID: checkpointed.conversationID
+                ) != nil else {
+                    queueReservations.removeValue(forKey: checkpointed.id)
+                    pairedReviewPrimaries.remove(checkpointed.conversationID)
+                    activityText = "Queue checkpoint failed"
+                    return
+                }
+                checkpointed.promptCheckpointed = true
+                queueReservations[checkpointed.id] = checkpointed
+            }
+            let previousProvider = conversations.first(where: {
+                $0.id == checkpointed.conversationID
+            })?.provider
+            guard await updateConversation(checkpointed.conversationID, mutate: {
+                if previousProvider != checkpointed.provider.providerKind {
+                    $0.providerSessionID = nil
+                }
+                $0.provider = checkpointed.provider.providerKind
+                $0.workflow = checkpointed.classification
+                $0.permissionMode = checkpointed.permission.permissionMode
+                $0.skillIDs = checkpointed.skills
+                $0.status = .queued
+            }) else {
+                queueReservations.removeValue(forKey: checkpointed.id)
+                pairedReviewPrimaries.remove(checkpointed.conversationID)
+                return
+            }
+            queueReservations.removeValue(forKey: checkpointed.id)
+            queuedDispatches.append(checkpointed)
+            activityText = plan.deferred.first?.reason == .insufficientHeadroom
+                ? "Queued until memory headroom recovers"
+                : "Queued behind active work"
+            return
+        }
+        reservedDispatches[pending.conversationID] = pending
+        await start(pending)
+    }
+
+    private func start(_ pending: PendingDispatch) async {
+        guard await linkedIdentityAllows(pending, revalidateSource: true) else {
+            reservedDispatches.removeValue(forKey: pending.conversationID)
+            pairedReviewPrimaries.remove(pending.conversationID)
+            await setStatus(.waitingForInput, for: pending.conversationID)
+            activityText = "Linked provider source needs attention"
+            return
+        }
+        guard let conversation = conversations.first(where: { $0.id == pending.conversationID }),
+              let workspace = workspaces.first(where: { $0.id == conversation.workspaceID }) else {
+            reservedDispatches.removeValue(forKey: pending.conversationID)
+            pairedReviewPrimaries.remove(pending.conversationID)
+            return
+        }
+        do {
+            let plan = try ProviderCommandBuilder.build(
+                provider: pending.provider,
+                workspaceURL: URL(fileURLWithPath: workspace.rootPath, isDirectory: true),
+                prompt: pending.prompt,
+                permission: pending.permission,
+                workflow: pending.workflow,
+                selectedSkills: pending.skills,
+                sessionID: conversation.provider == pending.provider.providerKind
+                    ? conversation.providerSessionID
+                    : nil
+            )
+            if !pending.promptCheckpointed {
+                guard await appendMessage(.user, content: pending.prompt, conversationID: conversation.id) != nil else {
+                    throw AppModelError.persistenceRequired
+                }
+            }
+            let providerChanged = conversation.provider != pending.provider.providerKind
+            guard await updateConversation(conversation.id, mutate: {
+                if providerChanged { $0.providerSessionID = nil }
+                $0.provider = pending.provider.providerKind
+                $0.workflow = pending.classification
+                $0.permissionMode = pending.permission.permissionMode
+                $0.skillIDs = pending.skills
+                $0.status = .running
+                if $0.title.hasPrefix("New ") {
+                    $0.title = Self.title(from: pending.prompt)
+                }
+            }) else { throw AppModelError.persistenceRequired }
+            lastAssistantText.removeValue(forKey: conversation.id)
+            let handoff = SerializedProviderEventHandoff { [weak self] event in
+                await self?.handle(event, conversationID: pending.conversationID)
+            }
+            let running = try providerRunner.start(plan) { event in
+                handoff.accept(event)
+            }
+            runningProcesses[pending.conversationID] = running
+            reservedDispatches.removeValue(forKey: pending.conversationID)
+            activityText = "\(pending.provider.displayName) running · \(pending.workflow.displayName)"
+        } catch {
+            reservedDispatches.removeValue(forKey: pending.conversationID)
+            pairedReviewPrimaries.remove(pending.conversationID)
+            _ = await appendMessage(.tool, content: error.localizedDescription, conversationID: conversation.id)
+            await setStatus(.failed, for: conversation.id)
+            activityText = "Dispatch failed"
+            alertText = error.localizedDescription
+        }
+    }
+
+    private func handle(_ event: ProviderStreamEvent, conversationID: UUID) async {
+        switch event {
+        case .batch(let events):
+            for event in events {
+                await handle(event, conversationID: conversationID)
+            }
+        case .sessionID(let sessionID):
+            guard let validatedID = UUID(uuidString: sessionID)?.uuidString.lowercased() else {
+                _ = await appendMessage(
+                    .tool,
+                    content: "The provider reported an invalid session identifier. It was ignored so this task can retry safely.",
+                    conversationID: conversationID
+                )
+                alertText = "Invalid provider session identity was ignored."
+                return
+            }
+            if let store {
+                do {
+                    if let linked = try await store.externalSession(forConversationID: conversationID),
+                       (linked.providerSessionID.lowercased() != validatedID
+                            || conversations.first(where: { $0.id == conversationID })?.provider != linked.provider) {
+                        _ = await appendMessage(
+                            .tool,
+                            content: "The provider reported a different session identity. The imported task link was preserved and not reassigned.",
+                            conversationID: conversationID
+                        )
+                        alertText = "Provider identity changed unexpectedly; this task was not relinked."
+                        return
+                    }
+                } catch {
+                    alertText = "Provider identity could not be verified: \(error.localizedDescription)"
+                    return
+                }
+            }
+            await updateConversation(conversationID) { $0.providerSessionID = validatedID }
+        case .text(let text):
+            lastAssistantText[conversationID] = text
+            _ = await appendMessage(.assistant, content: text, conversationID: conversationID)
+        case .result(let text):
+            if lastAssistantText[conversationID] != text {
+                lastAssistantText[conversationID] = text
+                _ = await appendMessage(.assistant, content: text, conversationID: conversationID)
+            }
+        case .activity(let label):
+            activityText = label
+        case .diagnostic(let text):
+            _ = await appendMessage(.tool, content: text, conversationID: conversationID)
+        case .exited(let status):
+            runningProcesses.removeValue(forKey: conversationID)
+            lastAssistantText.removeValue(forKey: conversationID)
+            let wasCancelled = cancellationRequestedIDs.remove(conversationID) != nil
+            let shouldLaunchPairedReview = pairedReviewPrimaries.remove(conversationID) != nil
+            let finalStatus: ConversationStatus = wasCancelled ? .cancelled : (status == 0 ? .completed : .failed)
+            await setStatus(finalStatus, for: conversationID)
+            activityText = wasCancelled
+                ? "Cancelled"
+                : (status == 0 ? "Ready for review" : "Provider exited with status \(status)")
+            if !wasCancelled, status == 0, shouldLaunchPairedReview {
+                await launchPairedReview(for: conversationID)
+            }
+            await drainQueueIfPossible()
+            await refreshLocalHistory(reason: "provider exit")
+        }
+    }
+
+    private func launchPairedReview(for primaryID: UUID) async {
+        guard let store,
+              let primary = conversations.first(where: { $0.id == primaryID }),
+              let workspace = workspaces.first(where: { $0.id == primary.workspaceID }) else { return }
+        let reviewer: RuntimeProvider = primary.provider == .codex ? .claude : .codex
+        let now = Date()
+        let review = Conversation(
+            workspaceID: workspace.id,
+            title: "Review · \(primary.title)",
+            provider: reviewer.providerKind,
+            workflow: .backgroundReview,
+            permissionMode: .readOnly,
+            status: .idle,
+            skillIDs: ["engineering:code-review"],
+            createdAt: now,
+            updatedAt: now
+        )
+        do {
+            try await store.insertConversation(review)
+            conversations.insert(review, at: 0)
+            let prompt = Self.pairedReviewPrompt(primaryID: primary.id)
+            let pending = PendingDispatch(
+                id: UUID(),
+                conversationID: review.id,
+                prompt: prompt,
+                provider: reviewer,
+                workflow: .direct,
+                classification: .backgroundReview,
+                permission: .readOnly,
+                skills: ["engineering:code-review"],
+                enqueuedAt: Date(),
+                promptCheckpointed: false
+            )
+            await admitOrQueue(pending)
+        } catch {
+            alertText = "Paired review could not start: \(error.localizedDescription)"
+        }
+    }
+
+    private func drainQueueIfPossible() async {
+        guard !queueDrainInProgress, !queuedDispatches.isEmpty else { return }
+        queueDrainInProgress = true
+        defer { queueDrainInProgress = false }
+        refreshMetricsWithoutDrain()
+        let memory = memorySnapshot ?? SystemMemorySnapshot(
+            physicalBytes: ProcessInfo.processInfo.physicalMemory,
+            availableBytes: ProcessInfo.processInfo.physicalMemory,
+            appResidentBytes: 0
+        )
+        let plan = governor.makeAdmissionPlan(
+            queuedJobs: queuedDispatches.map {
+                QueuedJob(
+                    id: $0.id,
+                    conversationID: $0.conversationID,
+                    provider: $0.provider.providerKind,
+                    workflow: $0.classification,
+                    enqueuedAt: $0.enqueuedAt
+                )
+            },
+            activeJobs: activeJobs(),
+            memory: memory,
+            mode: resourceMode
+        )
+        let admittedIDs = Set(plan.admitted.map(\.id))
+        let admitted = plan.admitted.compactMap { job in
+            queuedDispatches.first(where: { $0.id == job.id })
+        }
+        queuedDispatches.removeAll(where: { admittedIDs.contains($0.id) })
+        for pending in admitted {
+            reservedDispatches[pending.conversationID] = pending
+        }
+        for pending in admitted {
+            await start(pending)
+        }
+    }
+
+    private func activeJobs() -> [ActiveJob] {
+        let running: [ActiveJob] = runningProcesses.compactMap { conversationID, process -> ActiveJob? in
+            guard let conversation = conversations.first(where: { $0.id == conversationID }) else { return nil }
+            return ActiveJob(
+                id: process.id,
+                conversationID: conversationID,
+                provider: conversation.provider,
+                workflow: conversation.workflow,
+                startedAt: process.startedAt
+            )
+        }
+        let reserved = reservedDispatches.values.map { pending in
+            ActiveJob(
+                id: pending.id,
+                conversationID: pending.conversationID,
+                provider: pending.provider.providerKind,
+                workflow: pending.classification,
+                startedAt: pending.enqueuedAt
+            )
+        }
+        return running + reserved
+    }
+
+    @discardableResult
+    private func appendMessage(_ role: MessageRole, content: String, conversationID: UUID) async -> Message? {
+        guard let store else { return nil }
+        let sanitized = TerminalTextSanitizer.sanitize(content)
+        let bounded = sanitized.text
+        guard !bounded.isEmpty else { return nil }
+        do {
+            let message = try await store.appendMessage(
+                conversationID: conversationID,
+                role: role,
+                content: bounded
+            )
+            if selectedConversationID == conversationID {
+                messages.append(message)
+                trimVisibleTranscript()
+            }
+            return message
+        } catch {
+            alertText = "Message could not be saved: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    private func setStatus(_ status: ConversationStatus, for id: UUID) async {
+        await updateConversation(id) { $0.status = status }
+    }
+
+    @discardableResult
+    private func updateConversation(_ id: UUID, mutate: (inout Conversation) -> Void) async -> Bool {
+        guard let index = conversations.firstIndex(where: { $0.id == id }), let store else { return false }
+        var updated = conversations[index]
+        mutate(&updated)
+        updated.updatedAt = Date()
+        // Publish synchronously before the actor hop so reentrant events for the
+        // same conversation compose on the latest state instead of stale copies.
+        conversations[index] = updated
+        do {
+            try await store.updateConversation(updated)
+            return true
+        } catch {
+            if let persisted = try? await store.conversation(id: id),
+               let refreshedIndex = conversations.firstIndex(where: { $0.id == id }),
+               conversations[refreshedIndex] == updated {
+                conversations[refreshedIndex] = persisted
+            }
+            alertText = "Task state could not be saved: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func adoptSettings(from conversation: Conversation?) {
+        guard let conversation else { return }
+        selectedProvider = conversation.provider.runtimeProvider
+        selectedWorkflow = conversation.workflow.runtimeWorkflow
+        selectedPermission = conversation.permissionMode.runtimePermission
+        selectedSkills = Set(conversation.skillIDs)
+    }
+
+    private func refreshMetricsWithoutDrain() {
+        memorySnapshot = try? metrics.snapshot()
+    }
+
+    private func canonicalWorkspacePath(_ path: String?) -> String? {
+        guard let path, path.hasPrefix("/") else { return nil }
+        let resolved = URL(fileURLWithPath: path, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard resolved.path != "/",
+              (try? resolved.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+            return nil
+        }
+        return resolved.path
+    }
+
+    private func standardizedStoredPath(_ path: String?) -> String? {
+        guard let path, path.hasPrefix("/") else { return nil }
+        let standardized = URL(fileURLWithPath: path, isDirectory: true)
+            .standardizedFileURL.path
+        return standardized == "/" ? nil : standardized
+    }
+
+    private func approvedWorkspace(for session: ExternalSession) -> Workspace? {
+        guard let canonical = canonicalWorkspacePath(session.workspacePath),
+              let workspace = workspaces.first(where: { $0.rootPath == canonical }),
+              canonicalWorkspacePath(workspace.rootPath) == workspace.rootPath else {
+            return nil
+        }
+        return workspace
+    }
+
+    static func conversationIdentityMatches(
+        _ conversation: Conversation,
+        session: ExternalSession,
+        workspace: Workspace
+    ) -> Bool {
+        guard conversation.provider == session.provider,
+              conversation.workspaceID == workspace.id,
+              let conversationSessionID = conversation.providerSessionID,
+              let conversationUUID = UUID(uuidString: conversationSessionID),
+              let externalUUID = UUID(uuidString: session.providerSessionID) else {
+            return false
+        }
+        return conversationUUID == externalUUID
+    }
+
+    private func linkedIdentityAllows(
+        _ pending: PendingDispatch,
+        revalidateSource: Bool
+    ) async -> Bool {
+        guard let store,
+              let conversation = conversations.first(where: { $0.id == pending.conversationID }) else {
+            return false
+        }
+        do {
+            guard let linked = try await store.externalSession(
+                forConversationID: pending.conversationID
+            ) else { return true }
+            guard pending.provider.providerKind == linked.provider,
+                  let workspace = approvedWorkspace(for: linked),
+                  Self.conversationIdentityMatches(
+                    conversation,
+                    session: linked,
+                    workspace: workspace
+                  ) else {
+                alertText = "This task is linked to \(linked.surface.displayName) \(linked.providerSessionID). Continue it with its original provider, or create a new app task to switch providers."
+                return false
+            }
+            guard revalidateSource else { return true }
+            let validation = await historyCoordinator.revalidate(session: linked)
+            guard let currentConversation = conversations.first(where: {
+                $0.id == pending.conversationID
+            }) else { return false }
+            switch validation.state {
+            case .available:
+                guard let refreshed = validation.refreshedSession,
+                      validation.permitsResume,
+                      let refreshedWorkspace = approvedWorkspace(for: refreshed),
+                      pending.provider.providerKind == refreshed.provider,
+                      Self.conversationIdentityMatches(
+                        currentConversation,
+                        session: refreshed,
+                        workspace: refreshedWorkspace
+                      ) else {
+                    alertText = "The linked provider source changed identity or project folder. Reopen it from Local History and approve the current exact folder."
+                    return false
+                }
+                try await store.upsertExternalSessions([refreshed])
+                return true
+            case .unavailable:
+                try await store.markExternalSessionMissing(id: linked.id, at: validation.checkedAt)
+                if let index = externalSessions.firstIndex(where: { $0.id == linked.id }),
+                   let missing = try await store.externalSession(id: linked.id) {
+                    externalSessions[index] = missing
+                }
+                alertText = "This linked provider task is no longer present locally. It was marked missing and no process was started."
+                return false
+            case .indeterminate:
+                alertText = "\(validation.diagnostic?.detail ?? "The linked provider source could not be revalidated safely.") No process was started; refresh and retry."
+                return false
+            }
+        } catch {
+            alertText = "The linked provider identity could not be verified: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func trimVisibleTranscript() {
+        var retainedBytes = messages.reduce(0) { partial, message in
+            partial + message.content.utf8.count
+        }
+        while messages.count > SQLiteStore.maximumTranscriptMessageCount
+            || retainedBytes > SQLiteStore.maximumTranscriptBytes {
+            guard let oldest = messages.first else { break }
+            retainedBytes -= oldest.content.utf8.count
+            messages.removeFirst()
+        }
+    }
+
+    private static func title(from prompt: String) -> String {
+        let first = prompt.split(whereSeparator: \.isNewline).first.map(String.init) ?? "New task"
+        let trimmed = first.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.count > 72 ? String(trimmed.prefix(69)) + "…" : trimmed
+    }
+
+    static func pairedReviewPrompt(primaryID: UUID) -> String {
+        """
+        Independently review the current workspace changes for paired task ID \(primaryID.uuidString.lowercased()). Use the engineering code-review standard: report only actionable defects, rank by severity, cite exact files and lines, verify tests where safe, make no edits, and end with residual risks or ‘no findings’.
+        """
+    }
+
+    private static func databaseURL() throws -> URL {
+        let manager = FileManager.default
+        guard let support = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        return support
+            .appendingPathComponent("Local Command Center", isDirectory: true)
+            .appendingPathComponent("command-center.sqlite", isDirectory: false)
+    }
+
+}
+
+enum AppModelError: LocalizedError {
+    case persistenceRequired
+
+    var errorDescription: String? {
+        "The turn was not started because its local checkpoint could not be saved."
+    }
+}

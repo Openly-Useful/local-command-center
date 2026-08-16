@@ -1,0 +1,17 @@
+.build/
+dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.xcuserstate
+.DS_Store
+
+# Provider/controller runtime state is local-only and must never be published.
+.claude/
+.codex/
+
+# Local-only orchestration evidence contains machine paths or runtime state.
+PROJECT_HANDOFF.md
+.claude/orchestration/execution-state.yaml
+.claude/orchestration/recovery-ledger.yaml
+.claude/orchestration/verification-evidence.md
