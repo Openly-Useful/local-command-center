@@ -70,7 +70,8 @@ enum ProviderCommandBuilder {
         permission: RuntimePermission,
         workflow: RuntimeWorkflow,
         selectedSkills: [String],
-        sessionID: String?
+        sessionID: String?,
+        executableURL: URL? = nil
     ) throws -> ProviderLaunchPlan {
         guard workspaceURL.isFileURL else {
             throw ProviderLaunchError.invalidWorkspace
@@ -97,7 +98,8 @@ enum ProviderCommandBuilder {
         } else {
             validatedSessionID = nil
         }
-        guard let executable = ExecutableResolver.resolve(provider.rawValue) else {
+        guard let executable = executableURL ?? ExecutableResolver.resolve(provider.rawValue),
+              FileManager.default.isExecutableFile(atPath: executable.path) else {
             throw ProviderLaunchError.missingExecutable(provider)
         }
 

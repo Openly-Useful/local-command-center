@@ -20,6 +20,8 @@ private final class ProviderEventRecorder: @unchecked Sendable {
 }
 
 final class ProviderRuntimeTests: XCTestCase {
+    private let fixtureExecutableURL = URL(fileURLWithPath: "/usr/bin/true")
+
     func testProviderLaunchRejectsWorkspaceReplacedBySymlink() throws {
         let fixture = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -36,7 +38,8 @@ final class ProviderRuntimeTests: XCTestCase {
             permission: .readOnly,
             workflow: .direct,
             selectedSkills: [],
-            sessionID: nil
+            sessionID: nil,
+            executableURL: fixtureExecutableURL
         )) { error in
             guard case ProviderLaunchError.invalidWorkspace = error else {
                 return XCTFail("Expected invalidWorkspace, received \(error)")
@@ -55,7 +58,8 @@ final class ProviderRuntimeTests: XCTestCase {
             permission: .readOnly,
             workflow: .direct,
             selectedSkills: [],
-            sessionID: nil
+            sessionID: nil,
+            executableURL: fixtureExecutableURL
         )
 
         XCTAssertEqual(plan.prompt, prompt)
@@ -75,7 +79,8 @@ final class ProviderRuntimeTests: XCTestCase {
             permission: .workspaceWrite,
             workflow: .direct,
             selectedSkills: [],
-            sessionID: sessionID
+            sessionID: sessionID,
+            executableURL: fixtureExecutableURL
         )
 
         let resumeIndex = try XCTUnwrap(plan.arguments.firstIndex(of: "resume"))
@@ -94,7 +99,8 @@ final class ProviderRuntimeTests: XCTestCase {
             permission: .workspaceWrite,
             workflow: .direct,
             selectedSkills: [],
-            sessionID: "--dangerously-bypass-approvals-and-sandbox"
+            sessionID: "--dangerously-bypass-approvals-and-sandbox",
+            executableURL: fixtureExecutableURL
         )) { error in
             guard case ProviderLaunchError.invalidSessionID = error else {
                 return XCTFail("Expected invalid session ID, got \(error)")
@@ -111,7 +117,8 @@ final class ProviderRuntimeTests: XCTestCase {
             permission: .readOnly,
             workflow: .pickupSwarm,
             selectedSkills: ["pickup-swarm"],
-            sessionID: nil
+            sessionID: nil,
+            executableURL: fixtureExecutableURL
         )
 
         XCTAssertFalse(plan.arguments.contains(where: { $0.contains("rm -rf") }))
