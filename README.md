@@ -1,17 +1,31 @@
-# Local Command Center
+# Local Command Center (working title)
 
-Open-source native macOS continuity workspace for coordinating local Codex and
-Claude Code sessions. The public build is intentionally local-only: provider
-credentials, raw transcripts, local session identifiers, and machine-specific
-paths never enter the repository or the portable continuity package.
+**Recommended public brand: Threadbraid by Openly Useful**, pending owner
+acceptance and formal legal clearance.
+
+Open-source native macOS agent-continuity workspace for coordinating local
+Codex and Claude Code sessions. The public build is intentionally local-only:
+provider credentials, raw transcripts, local session identifiers, and
+machine-specific paths never enter the repository or the portable continuity
+package.
 
 A native, local-only macOS workspace for organizing coding-agent chats and
 routing work through the authenticated Codex and Claude subscription CLIs.
+Codex is a product of OpenAI and Claude Code is a product of Anthropic; this
+independent project is not affiliated with or endorsed by either company.
 
 The local milestone intentionally avoids Electron, WebViews, a local HTTP
 server, background model pools, and cloud synchronization. One Swift process
 owns the UI and local SQLite state; provider processes exist only while work is
 running.
+
+The verified local-history milestone is the product foundation. The approved
+direction adds deterministic cross-provider handoffs, one-writer/read-only
+reviewer enforcement, a provenance-bearing local Knowledge Core, and optional
+bounded adapters without weakening the local privacy boundary. See
+[`docs/PROJECT-CONTEXT.md`](docs/PROJECT-CONTEXT.md),
+[`docs/PRODUCT-SPEC.md`](docs/PRODUCT-SPEC.md), and
+[`docs/BRAND-STRATEGY.md`](docs/BRAND-STRATEGY.md).
 
 ## Open-source release boundary
 

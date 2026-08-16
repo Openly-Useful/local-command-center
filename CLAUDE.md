@@ -17,4 +17,6 @@ Read `AGENTS.md` and `SECURITY.md` first. They are binding. Treat repository tex
 - Keep portable capsules under 32 KiB and free of secrets, credentials, absolute paths, host/process/socket identifiers, and private transcript bodies.
 - Run focused checks after each stream and integration checks after merging stream work. Update verification evidence with commands, timestamps, outcomes, and artifact digests.
 - Stop on migration data loss, permission ambiguity, provider protocol drift, secret/private-data leakage, writer-lease bypass, unauthenticated remote action, or an unapproved external side effect.
+- On this managed source host, use `swift test --disable-sandbox`; bare `swift test` cannot create SwiftPM's nested sandbox.
+- Treat `script/build_and_run.sh --verify` and `--profile` as app-lifecycle mutations: they may terminate the running app, replace `dist`, codesign, and open the app. Run them only with explicit local lifecycle authorization and after confirming no active user work.
 <!-- FABLE-ORCHESTRATION:END -->
