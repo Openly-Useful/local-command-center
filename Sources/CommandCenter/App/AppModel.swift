@@ -34,6 +34,123 @@ actor ObsidianProjectionCoordinator {
     }
 }
 
+/// A read-only, per-action handoff preview. It contains only the compact
+/// continuity boundary and repository facts needed for an explicit operator
+/// confirmation; no provider transcript or session identity is copied here.
+struct ContinuityHandoffPreview: Identifiable, Equatable {
+    let id: UUID
+    let sourceConversationID: UUID
+    let destination: RuntimeProvider
+    let reviewOnly: Bool
+    let sourceTitle: String
+    let boundary: ContinuityHandoffBoundary
+    let recoveryError: String?
+
+    init(
+        id: UUID = UUID(),
+        sourceConversationID: UUID,
+        destination: RuntimeProvider,
+        reviewOnly: Bool,
+        sourceTitle: String,
+        boundary: ContinuityHandoffBoundary,
+        recoveryError: String? = nil
+    ) {
+        self.id = id
+        self.sourceConversationID = sourceConversationID
+        self.destination = destination
+        self.reviewOnly = reviewOnly
+        self.sourceTitle = sourceTitle
+        self.boundary = boundary
+        self.recoveryError = recoveryError
+    }
+
+    var isConfirmable: Bool { recoveryError == nil }
+    var modeTitle: String { reviewOnly ? "Read-only review" : "Compact continuation" }
+    var permissionLabel: String { "Read only" }
+    var usageDisclosure: String {
+        reviewOnly
+            ? "The reviewer receives a bounded continuity capsule and can only return advisory findings. It cannot write to the workspace."
+            : "The destination first validates this bounded capsule in read-only mode. Destination processing consumes that provider's usage."
+    }
+}
+
+struct SelectedContinuityStatus: Equatable {
+    enum Role: String, Equatable {
+        case source
+        case destination
+    }
+
+    let projectName: String
+    let handoffTitle: String
+    let handoffState: ContinuityHandoffState
+    let role: Role
+    let capsuleDigest: String
+    let revision: Int
+    let commit: String
+    let statusDigest: String
+    let changedPaths: [String]
+    let isActiveWriter: Bool
+    let isReadOnlyReviewer: Bool
+    let requiresReconciliation: Bool
+
+    var roleLabel: String { role == .source ? "Source boundary" : "Destination continuation" }
+    var executionLabel: String {
+        isActiveWriter ? "Active writer" : (isReadOnlyReviewer ? "Read-only reviewer" : "No active writer")
+    }
+}
+
+enum ContinuityLineageSelection: Equatable {
+    case none
+    case unique(SelectedContinuityStatus)
+    case ambiguous
+
+    static func resolve(_ candidates: [SelectedContinuityStatus]) -> Self {
+        switch candidates.count {
+        case 0: .none
+        case 1: .unique(candidates[0])
+        default: .ambiguous
+        }
+    }
+}
+
+enum ContinuityPreviewConfirmationGate {
+    static func canPresentPreparedPreview(
+        sourceConversationID: UUID,
+        selectedConversationID: UUID?,
+        sourceIsReady: Bool
+    ) -> Bool {
+        selectedConversationID == sourceConversationID && sourceIsReady
+    }
+
+    static func canBegin(
+        preview: ContinuityHandoffPreview?,
+        isInFlight: Bool,
+        consumedIDs: Set<UUID>
+    ) -> Bool {
+        guard let preview else { return false }
+        return preview.isConfirmable && !isInFlight && !consumedIDs.contains(preview.id)
+    }
+
+    static func remainsValid(
+        preview: ContinuityHandoffPreview,
+        selectedConversationID: UUID?,
+        currentPreviewID: UUID?,
+        isInFlight: Bool,
+        consumedIDs: Set<UUID>,
+        sourceIsReady: Bool,
+        provider: RuntimeProvider,
+        reviewOnly: Bool
+    ) -> Bool {
+        selectedConversationID == preview.sourceConversationID
+            && currentPreviewID == preview.id
+            && isInFlight
+            && consumedIDs.contains(preview.id)
+            && sourceIsReady
+            && preview.destination == provider
+            && preview.reviewOnly == reviewOnly
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     private static let maximumPromptBytes = 256 * 1_024
@@ -110,6 +227,10 @@ final class AppModel: ObservableObject {
     @Published var connectedObsidianVaultPath: String?
     @Published var obsidianProjectionStatus = "Not connected"
     @Published var obsidianProjectedFileCount = 0
+    @Published var continuityPreview: ContinuityHandoffPreview?
+    @Published var selectedContinuityStatus: SelectedContinuityStatus?
+    @Published var continuityStatusWarning: String?
+    @Published var isContinuityConfirmationInFlight = false
 
     private let providerHealthService = ProviderHealthService()
     private let providerRunner = ProviderProcessRunner()
@@ -129,6 +250,7 @@ final class AppModel: ObservableObject {
     /// SQLite, so a crashed app can recover safely after its bounded expiry.
     private var continuityWriterLeases: [UUID: ContinuityWorkstreamWriterLease] = [:]
     private var continuityWriterHeartbeatTasks: [UUID: Task<Void, Never>] = [:]
+    private var consumedContinuityPreviewIDs: Set<UUID> = []
     private var preparingConversationIDs: Set<UUID> = []
     private var pairedReviewPrimaries: Set<UUID> = []
     private var lastAssistantText: [UUID: String] = [:]
@@ -330,6 +452,7 @@ final class AppModel: ObservableObject {
             if let selectedConversationID {
                 messages = try await database.listRecentMessages(conversationID: selectedConversationID)
                 adoptSettings(from: selectedConversation)
+                await refreshSelectedContinuityStatus()
             }
             activityText = "Local database ready"
         } catch {
@@ -828,24 +951,112 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Creates an app-owned successor or read-only reviewer task. Provider
-    /// identities remain immutable: this always creates a new local task and
-    /// records the relationship in the continuity ledger.
-    func continueSelected(in provider: RuntimeProvider, reviewOnly: Bool = false) async {
+    /// Builds a non-mutating handoff preview for an explicit confirmation.
+    /// A fresh prepare is also performed at confirmation so a changed capsule
+    /// or Git boundary cannot be accepted from a stale sheet.
+    func prepareContinuityPreview(in provider: RuntimeProvider, reviewOnly: Bool = false) async {
+        continuityPreview = nil
         guard let source = selectedConversation,
-              let workspace = workspaces.first(where: { $0.id == source.workspaceID }),
-              let store else { return }
+              let workspace = workspaces.first(where: { $0.id == source.workspaceID }) else { return }
         guard source.provider.runtimeProvider != provider || reviewOnly else {
             alertText = "Choose the other provider for a continuity handoff."
             return
         }
-        guard runningProcesses[source.id] == nil,
-              reservedDispatches[source.id] == nil,
-              !preparingConversationIDs.contains(source.id),
-              !queuedDispatches.contains(where: { $0.conversationID == source.id }),
-              !queueReservations.values.contains(where: { $0.conversationID == source.id }) else {
+        guard isSourceReadyForContinuity(source.id) else {
             alertText = "Finish or stop the source task before creating a continuity handoff."
             return
+        }
+        do {
+            let sourceLabel = source.provider.displayName
+            let destinationLabel = provider.displayName
+            let preflight = try await Task.detached(priority: .userInitiated) {
+                try ContinuityHandoffPreflight().prepare(
+                    workspaceURL: URL(fileURLWithPath: workspace.rootPath, isDirectory: true),
+                    sourceLabel: sourceLabel,
+                    destinationLabel: destinationLabel
+                )
+            }.value
+            guard ContinuityPreviewConfirmationGate.canPresentPreparedPreview(
+                sourceConversationID: source.id,
+                selectedConversationID: selectedConversation?.id,
+                sourceIsReady: isSourceReadyForContinuity(source.id)
+            ) else {
+                return
+            }
+            continuityPreview = ContinuityHandoffPreview(
+                sourceConversationID: source.id,
+                destination: provider,
+                reviewOnly: reviewOnly,
+                sourceTitle: source.title,
+                boundary: preflight.boundary
+            )
+        } catch {
+            alertText = "Continuity preflight blocked: \(error.localizedDescription)"
+        }
+    }
+
+    func dismissContinuityPreview() {
+        continuityPreview = nil
+    }
+
+    func confirmContinuityPreview() async {
+        guard ContinuityPreviewConfirmationGate.canBegin(
+            preview: continuityPreview,
+            isInFlight: isContinuityConfirmationInFlight,
+            consumedIDs: consumedContinuityPreviewIDs
+        ), let preview = continuityPreview else {
+            alertText = continuityPreview?.recoveryError ?? "Prepare a valid continuity preflight before confirming."
+            return
+        }
+        consumedContinuityPreviewIDs.insert(preview.id)
+        isContinuityConfirmationInFlight = true
+        defer { isContinuityConfirmationInFlight = false }
+        let created = await continueSelected(
+            in: preview.destination,
+            reviewOnly: preview.reviewOnly,
+            expectedPreview: preview
+        )
+        if created {
+            continuityPreview = nil
+        } else if continuityPreview?.id == preview.id {
+            continuityPreview = ContinuityHandoffPreview(
+                id: preview.id,
+                sourceConversationID: preview.sourceConversationID,
+                destination: preview.destination,
+                reviewOnly: preview.reviewOnly,
+                sourceTitle: preview.sourceTitle,
+                boundary: preview.boundary,
+                recoveryError: alertText ?? "The preview could not be confirmed. Prepare a new preview."
+            )
+        }
+    }
+
+    /// Creates an app-owned successor or read-only reviewer task. Provider
+    /// identities remain immutable: this always creates a new local task and
+    /// records the relationship in the continuity ledger.
+    @discardableResult
+    func continueSelected(
+        in provider: RuntimeProvider,
+        reviewOnly: Bool = false,
+        expectedPreview: ContinuityHandoffPreview? = nil
+    ) async -> Bool {
+        guard let source = selectedConversation,
+              let workspace = workspaces.first(where: { $0.id == source.workspaceID }),
+              let store else { return false }
+        guard source.provider.runtimeProvider != provider || reviewOnly else {
+            alertText = "Choose the other provider for a continuity handoff."
+            return false
+        }
+        guard isSourceReadyForContinuity(source.id) else {
+            alertText = "Finish or stop the source task before creating a continuity handoff."
+            return false
+        }
+        if let expectedPreview,
+           (expectedPreview.sourceConversationID != source.id
+                || expectedPreview.destination != provider
+                || expectedPreview.reviewOnly != reviewOnly) {
+            alertText = "The continuity preview no longer matches this task. Prepare a new preview."
+            return false
         }
         let now = Date()
         do {
@@ -859,6 +1070,23 @@ final class AppModel: ObservableObject {
                     destinationLabel: destinationLabel
                 )
             }.value
+            if let expectedPreview, preflight.boundary != expectedPreview.boundary {
+                throw AppModelError.continuityPreviewStale
+            }
+            if let expectedPreview {
+                guard ContinuityPreviewConfirmationGate.remainsValid(
+                    preview: expectedPreview,
+                    selectedConversationID: selectedConversation?.id,
+                    currentPreviewID: continuityPreview?.id,
+                    isInFlight: isContinuityConfirmationInFlight,
+                    consumedIDs: consumedContinuityPreviewIDs,
+                    sourceIsReady: isSourceReadyForContinuity(source.id),
+                    provider: provider,
+                    reviewOnly: reviewOnly
+                ) else {
+                    throw AppModelError.continuityPreviewStale
+                }
+            }
             let boundarySummary = try preflight.boundary.encodedSummary()
             let existingProject = try await store.listContinuityProjects(workspaceID: workspace.id).first
             let project = try existingProject ?? ContinuityProject(
@@ -931,15 +1159,28 @@ final class AppModel: ObservableObject {
             selectedWorkflow = .direct
             selectedPermission = .readOnly
             selectedSkills = Set(destination.skillIDs)
+            await refreshSelectedContinuityStatus()
+            return true
         } catch {
             alertText = "Continuity handoff could not be created: \(error.localizedDescription)"
+            return false
         }
+    }
+
+    private func isSourceReadyForContinuity(_ conversationID: UUID) -> Bool {
+        runningProcesses[conversationID] == nil
+            && reservedDispatches[conversationID] == nil
+            && !preparingConversationIDs.contains(conversationID)
+            && !queuedDispatches.contains(where: { $0.conversationID == conversationID })
+            && !queueReservations.values.contains(where: { $0.conversationID == conversationID })
     }
 
     func selectConversation(_ id: UUID?) async {
         selectedConversationID = id
         guard let id, let store else {
             messages = []
+            selectedContinuityStatus = nil
+            continuityStatusWarning = nil
             return
         }
         do {
@@ -947,8 +1188,73 @@ final class AppModel: ObservableObject {
             guard selectedConversationID == id else { return }
             messages = loaded
             adoptSettings(from: conversations.first(where: { $0.id == id }))
+            await refreshSelectedContinuityStatus()
         } catch {
             alertText = "Conversation could not be loaded: \(error.localizedDescription)"
+        }
+    }
+
+    /// Loads concise bridge-owned continuity metadata for the currently
+    /// selected task. Provider sessions and transcript locations remain local
+    /// transport details and are deliberately not represented in this view.
+    func refreshSelectedContinuityStatus() async {
+        guard let conversation = selectedConversation, let store else {
+            selectedContinuityStatus = nil
+            continuityStatusWarning = nil
+            return
+        }
+        do {
+            var candidates: [SelectedContinuityStatus] = []
+            for project in try await store.listContinuityProjects(workspaceID: conversation.workspaceID) {
+                let links = try await store.listContinuitySessionLinks(projectID: project.id)
+                let conversationLinks = links.filter { $0.conversationID == conversation.id }
+                guard !conversationLinks.isEmpty else { continue }
+                let handoffs = try await store.listContinuityHandoffs(projectID: project.id)
+                for link in conversationLinks {
+                    for handoff in handoffs where handoff.sourceSessionLinkID == link.id || handoff.destinationSessionLinkID == link.id {
+                        let boundary = try ContinuityHandoffBoundary.decode(summary: handoff.summary)
+                        let role: SelectedContinuityStatus.Role = handoff.sourceSessionLinkID == link.id ? .source : .destination
+                        let requiresReconciliation = try await store.continuityWorkstreamRequiresReconciliation(
+                            projectID: project.id,
+                            workstreamID: handoff.id
+                        )
+                        let hasActiveWriter = try await store.hasActiveContinuityWorkstreamWriterLease(
+                            projectID: project.id,
+                            workstreamID: handoff.id
+                        )
+                        candidates.append(SelectedContinuityStatus(
+                            projectName: project.name,
+                            handoffTitle: handoff.title,
+                            handoffState: handoff.state,
+                            role: role,
+                            capsuleDigest: boundary.capsuleDigest,
+                            revision: boundary.version,
+                            commit: boundary.commit,
+                            statusDigest: boundary.statusDigest,
+                            changedPaths: Array(boundary.changedPaths.prefix(12)),
+                            isActiveWriter: hasActiveWriter,
+                            isReadOnlyReviewer: conversation.workflow == .backgroundReview
+                                && conversation.permissionMode == .readOnly,
+                            requiresReconciliation: requiresReconciliation
+                        ))
+                    }
+                }
+            }
+            guard selectedConversationID == conversation.id else { return }
+            switch ContinuityLineageSelection.resolve(candidates) {
+            case .none:
+                selectedContinuityStatus = nil
+                continuityStatusWarning = nil
+            case let .unique(status):
+                selectedContinuityStatus = status
+                continuityStatusWarning = nil
+            case .ambiguous:
+                selectedContinuityStatus = nil
+                continuityStatusWarning = "Continuity lineage is ambiguous. Audit and reconcile the linked handoffs before continuing."
+            }
+        } catch {
+            selectedContinuityStatus = nil
+            continuityStatusWarning = "Continuity status requires reconciliation: \(error.localizedDescription)"
         }
     }
 
@@ -1182,6 +1488,7 @@ final class AppModel: ObservableObject {
                     ? "Exclusive writer lease released after provider completion."
                     : "Exclusive writer lease released after provider failure or cancellation."
             ))
+            await refreshSelectedContinuityStatus()
         } catch {
             await requireContinuityReconciliation(
                 for: conversationID,
@@ -1419,12 +1726,18 @@ final class AppModel: ObservableObject {
                 guard let store else { throw AppModelError.persistenceRequired }
                 let handoff = writerHandoff.handoff
                 if writerHandoff.role == .source {
+                    _ = try await store.requireContinuityWorkstreamReconciliation(
+                        projectID: handoff.projectID,
+                        workstreamID: handoff.id,
+                        reason: "Source task attempted a writable turn after its handoff boundary."
+                    )
                     try await store.insertContinuityEvent(try ContinuityEvent(
                         projectID: handoff.projectID,
                         handoffID: handoff.id,
                         kind: .note,
                         detail: "Source task attempted a writable turn after its handoff boundary. Reconciliation is required."
                     ))
+                    await refreshSelectedContinuityStatus()
                     throw AppModelError.continuitySourceDivergent
                 }
                 guard let acquired = try await ContinuityWriterLeaseGate.acquireIfWritable(
@@ -1484,6 +1797,7 @@ final class AppModel: ObservableObject {
                 continuityWriterLeases[pending.conversationID] = acquiredWriterLease
                 startContinuityWriterHeartbeat(for: pending.conversationID)
                 writerLease = nil
+                await refreshSelectedContinuityStatus()
             }
             if let handoffID = pending.continuityHandoffID {
                 do {
@@ -1910,6 +2224,7 @@ enum AppModelError: LocalizedError {
     case continuityWriterLeaseLost
     case continuityReviewerMustRemainReadOnly
     case continuitySourceDivergent
+    case continuityPreviewStale
 
     var errorDescription: String? {
         switch self {
@@ -1929,6 +2244,8 @@ enum AppModelError: LocalizedError {
             "Reviewer tasks are read-only and cannot acquire a continuity writer lease."
         case .continuitySourceDivergent:
             "The source task advanced after its handoff boundary. Reconcile the divergent branches before another writable turn."
+        case .continuityPreviewStale:
+            "The continuity capsule or Git boundary changed after this preview. Prepare a new preview before confirming."
         }
     }
 }

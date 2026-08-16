@@ -48,7 +48,7 @@ struct DetailHeader: View {
                 Menu {
                     ForEach(RuntimeProvider.allCases.filter { $0 != conversation.provider.runtimeProvider }) { provider in
                         Button("Continue in \(provider.displayName)") {
-                            Task { await model.continueSelected(in: provider) }
+                            Task { await model.prepareContinuityPreview(in: provider) }
                         }
                     }
                 } label: {
@@ -58,7 +58,7 @@ struct DetailHeader: View {
                 Menu {
                     ForEach(RuntimeProvider.allCases.filter { $0 != conversation.provider.runtimeProvider }) { provider in
                         Button("Review with \(provider.displayName)") {
-                            Task { await model.continueSelected(in: provider, reviewOnly: true) }
+                            Task { await model.prepareContinuityPreview(in: provider, reviewOnly: true) }
                         }
                     }
                 } label: {
@@ -97,8 +97,130 @@ struct DetailHeader: View {
             .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Pursuing goal, \(conversation.title)")
+
+            if let status = model.selectedContinuityStatus {
+                ContinuityStatusCard(status: status)
+            }
+            if let warning = model.continuityStatusWarning {
+                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityLabel("Continuity reconciliation required. \(warning)")
+            }
         }
         .padding(16)
+        .sheet(item: $model.continuityPreview) { preview in
+            ContinuityPreflightSheet(preview: preview)
+                .environmentObject(model)
+        }
+    }
+}
+
+struct ContinuityStatusCard: View {
+    let status: SelectedContinuityStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Label("Project continuity", systemImage: "arrow.triangle.branch")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Text(status.executionLabel)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(status.isActiveWriter ? .orange : .secondary)
+            }
+            Text(status.handoffTitle)
+                .font(.callout.weight(.medium))
+                .lineLimit(1)
+            Text("\(status.projectName) · \(status.roleLabel) · \(status.handoffState.rawValue.capitalized)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Capsule v\(status.revision) \(status.capsuleDigest.prefix(12)) · Git \(status.commit.prefix(12)) · status \(status.statusDigest.prefix(12))")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            if !status.changedPaths.isEmpty {
+                Text("Bounded changed paths: \(status.changedPaths.joined(separator: ", "))")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            if status.requiresReconciliation {
+                Label("Divergence or writer ownership requires audited reconciliation before another writable launch.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Continuity status. \(status.handoffTitle). \(status.roleLabel). \(status.executionLabel).")
+    }
+}
+
+struct ContinuityPreflightSheet: View {
+    @EnvironmentObject private var model: AppModel
+    let preview: ContinuityHandoffPreview
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(preview.modeTitle)
+                .font(.title2.weight(.semibold))
+            Text("Prepare a separate \(preview.destination.displayName) task from the validated bridge boundary below. This does not merge provider conversations.")
+                .foregroundStyle(.secondary)
+
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 9) {
+                GridRow { Text("Route").foregroundStyle(.secondary); Text("\(preview.boundary.sourceLabel) → \(preview.boundary.destinationLabel)") }
+                GridRow { Text("Permission").foregroundStyle(.secondary); Text(preview.permissionLabel) }
+                GridRow { Text("Capsule").foregroundStyle(.secondary); Text("v\(preview.boundary.version) \(preview.boundary.capsuleDigest)").font(.caption.monospaced()) }
+                GridRow { Text("Git commit").foregroundStyle(.secondary); Text(preview.boundary.commit).font(.caption.monospaced()) }
+                GridRow { Text("Status digest").foregroundStyle(.secondary); Text(preview.boundary.statusDigest).font(.caption.monospaced()) }
+            }
+            if !preview.boundary.changedPaths.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Bounded changed paths")
+                        .font(.caption.weight(.semibold))
+                    ForEach(preview.boundary.changedPaths.prefix(12), id: \.self) { path in
+                        Text(path).font(.caption.monospaced())
+                    }
+                }
+            }
+            Text(preview.usageDisclosure)
+                .font(.callout)
+                .padding(10)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            if let recoveryError = preview.recoveryError {
+                Label(recoveryError, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("Continuity preflight invalid. \(recoveryError)")
+            }
+            HStack {
+                Button("Cancel") { model.dismissContinuityPreview() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button(preview.reviewOnly ? "Create Read-only Reviewer" : "Create Continuation") {
+                    Task { await model.confirmContinuityPreview() }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!preview.isConfirmable || model.isContinuityConfirmationInFlight)
+                .accessibilityHint(preview.isConfirmable && !model.isContinuityConfirmationInFlight
+                    ? "Creates the separate task after one final boundary validation."
+                    : "Disabled until a new valid continuity preview is prepared.")
+                if model.isContinuityConfirmationInFlight {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Confirming continuity preflight")
+                }
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 520, maxWidth: 680, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Continuity preflight")
     }
 }
 

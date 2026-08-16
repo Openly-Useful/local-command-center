@@ -51,10 +51,37 @@ struct ContinuityHandoffBoundary: Codable, Equatable, Sendable {
         } catch {
             throw ContinuityHandoffPreflightError.invalidBoundary
         }
-        guard boundary.version == Self.schemaVersion else {
+        guard boundary.version == Self.schemaVersion,
+              Self.isLowercaseHex(boundary.capsuleDigest, length: 64),
+              Self.isLowercaseHex(boundary.statusDigest, length: 64),
+              (boundary.commit.count == 40 || boundary.commit.count == 64)
+                && Self.isLowercaseHex(boundary.commit, length: boundary.commit.count),
+              ["Codex", "Claude"].contains(boundary.sourceLabel),
+              ["Codex", "Claude"].contains(boundary.destinationLabel),
+              boundary.changedPaths.count <= 512,
+              boundary.changedPaths.allSatisfy(Self.isSafeChangedPath) else {
             throw ContinuityHandoffPreflightError.invalidBoundary
         }
         return boundary
+    }
+
+    private static func isLowercaseHex(_ value: String, length: Int) -> Bool {
+        value.utf8.count == length && value.unicodeScalars.allSatisfy {
+            (48 ... 57).contains($0.value) || (97 ... 102).contains($0.value)
+        }
+    }
+
+    private static func isSafeChangedPath(_ path: String) -> Bool {
+        guard !path.isEmpty,
+              path.utf8.count <= 1_024,
+              !path.hasPrefix("/"),
+              !path.hasPrefix("~"),
+              !path.contains("\\"),
+              !path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            return false
+        }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        return !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." })
     }
 }
 

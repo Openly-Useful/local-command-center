@@ -10,8 +10,8 @@ final class ContinuityHandoffPreflightTests: XCTestCase {
 
         let prepared = try preflight.prepare(
             workspaceURL: repository,
-            sourceLabel: "source",
-            destinationLabel: "destination"
+            sourceLabel: "Codex",
+            destinationLabel: "Claude"
         )
         let summary = try prepared.boundary.encodedSummary()
         let decoded = try ContinuityHandoffBoundary.decode(summary: summary)
@@ -29,8 +29,8 @@ final class ContinuityHandoffPreflightTests: XCTestCase {
         let preflight = ContinuityHandoffPreflight()
         let prepared = try preflight.prepare(
             workspaceURL: repository,
-            sourceLabel: "source",
-            destinationLabel: "destination"
+            sourceLabel: "Codex",
+            destinationLabel: "Claude"
         )
 
         try Data("Changed portable context.\n".utf8).write(
@@ -58,6 +58,23 @@ final class ContinuityHandoffPreflightTests: XCTestCase {
             )
         ) { error in
             XCTAssertEqual(error as? ContinuityHandoffPreflightError, .unownedChanges)
+        }
+    }
+
+    func testDecodeRejectsMalformedPersistedBoundaryBeforeItCanReachTheUI() throws {
+        let digest = String(repeating: "a", count: 64)
+        let commit = String(repeating: "b", count: 40)
+        let invalidSummaries = [
+            "{\"version\":1,\"capsuleDigest\":\"\(digest.uppercased())\",\"commit\":\"\(commit)\",\"statusDigest\":\"\(digest)\",\"sourceLabel\":\"Codex\",\"destinationLabel\":\"Claude\",\"changedPaths\":[]}",
+            "{\"version\":1,\"capsuleDigest\":\"\(digest)\",\"commit\":\"\(commit)\",\"statusDigest\":\"\(digest)\",\"sourceLabel\":\"Unknown\",\"destinationLabel\":\"Claude\",\"changedPaths\":[]}",
+            "{\"version\":1,\"capsuleDigest\":\"\(digest)\",\"commit\":\"\(commit)\",\"statusDigest\":\"\(digest)\",\"sourceLabel\":\"Codex\",\"destinationLabel\":\"Claude\",\"changedPaths\":[\"/private/transcript.jsonl\"]}",
+            "{\"version\":1,\"capsuleDigest\":\"\(digest)\",\"commit\":\"\(commit)\",\"statusDigest\":\"\(digest)\",\"sourceLabel\":\"Codex\",\"destinationLabel\":\"Claude\",\"changedPaths\":[\"../secret.txt\"]}",
+        ]
+
+        for summary in invalidSummaries {
+            XCTAssertThrowsError(try ContinuityHandoffBoundary.decode(summary: summary)) { error in
+                XCTAssertEqual(error as? ContinuityHandoffPreflightError, .invalidBoundary)
+            }
         }
     }
 

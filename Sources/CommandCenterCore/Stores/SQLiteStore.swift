@@ -1029,6 +1029,38 @@ public actor SQLiteStore {
         }
     }
 
+    /// Returns only whether a durable workstream lease is currently active.
+    /// The owner token remains local transport state and is never exposed to
+    /// UI consumers or continuity packages.
+    public func hasActiveContinuityWorkstreamWriterLease(
+        projectID: UUID,
+        workstreamID: UUID,
+        at timestamp: Date = Date()
+    ) throws -> Bool {
+        try validateContinuityDate(timestamp, field: "workstreamLeaseStatusAt")
+        let statement = try prepare(
+            """
+            SELECT 1 FROM continuity_workstream_writer_leases
+            WHERE project_id = ? AND workstream_id = ?
+              AND requires_reconciliation = 0
+              AND owner_token IS NOT NULL
+              AND lease_expires_at > ?
+            LIMIT 1
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind([
+            .text(projectID.uuidString),
+            .text(workstreamID.uuidString),
+            .double(timestamp.timeIntervalSince1970),
+        ], to: statement)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW: return true
+        case SQLITE_DONE: return false
+        default: throw sqliteError()
+        }
+    }
+
     public func continuityWorkstreamWriterLeaseRevision(
         projectID: UUID,
         workstreamID: UUID

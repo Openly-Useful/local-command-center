@@ -484,6 +484,37 @@ final class ContinuityStoreTests: XCTestCase {
         XCTAssertNil(deniedAcquire)
     }
 
+    func testActiveWriterLeaseStatusIsDurableAcrossStoreConnections() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let firstStore = try SQLiteStore(databaseURL: location.database)
+        let workspace = Workspace(
+            id: uuid(85), name: "Lease status", rootPath: "/lease-status",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        let project = try ContinuityProject(
+            id: uuid(86), workspaceID: workspace.id, name: "Lease status",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        try await firstStore.upsertWorkspace(workspace)
+        try await firstStore.upsertContinuityProject(project)
+        let workstreamID = uuid(87)
+        _ = try await firstStore.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: uuid(88),
+            now: date(10), duration: 60
+        )
+
+        let secondStore = try SQLiteStore(databaseURL: location.database)
+        let activeBeforeExpiry = try await secondStore.hasActiveContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, at: date(11)
+        )
+        XCTAssertTrue(activeBeforeExpiry)
+        let activeAfterExpiry = try await secondStore.hasActiveContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, at: date(70)
+        )
+        XCTAssertFalse(activeAfterExpiry)
+    }
+
     func testReconciliationEvidenceRejectsPathsSessionsAndSecretLikeValues() throws {
         let digest = String(repeating: "a", count: 64)
         XCTAssertNoThrow(try ContinuityWorkstreamReconciliationEvidence(
