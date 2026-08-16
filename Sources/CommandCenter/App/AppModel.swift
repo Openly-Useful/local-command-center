@@ -1087,7 +1087,6 @@ final class AppModel: ObservableObject {
                     throw AppModelError.continuityPreviewStale
                 }
             }
-            let boundarySummary = try preflight.boundary.encodedSummary()
             let existingProject = try await store.listContinuityProjects(workspaceID: workspace.id).first
             let project = try existingProject ?? ContinuityProject(
                 workspaceID: workspace.id,
@@ -1125,25 +1124,16 @@ final class AppModel: ObservableObject {
                 updatedAt: now
             )
             try await store.upsertContinuitySessionLink(destinationLink)
-            let handoff = try ContinuityHandoff(
+            let bridge = ProjectBridge(store: store, role: .writer)
+            _ = try await bridge.recordBoundaryHandoff(
                 projectID: project.id,
                 sourceSessionLinkID: sourceLink.id,
                 destinationSessionLinkID: destinationLink.id,
                 title: reviewOnly ? "Read-only review of \(source.title)" : "Compact continuation of \(source.title)",
-                summary: boundarySummary,
-                state: .ready,
-                createdAt: now,
-                updatedAt: now
+                boundary: preflight.boundary,
+                eventDetail: "Validated compact handoff prepared at capsule \(preflight.boundary.capsuleDigest.prefix(12)).",
+                now: now
             )
-            try await store.upsertContinuityHandoff(handoff)
-            try await store.insertContinuityEvent(try ContinuityEvent(
-                projectID: project.id,
-                sessionLinkID: destinationLink.id,
-                handoffID: handoff.id,
-                kind: .handoffCreated,
-                detail: "Validated compact handoff prepared at capsule \(preflight.boundary.capsuleDigest.prefix(12)).",
-                occurredAt: now
-            ))
             conversations.insert(destination, at: 0)
             selectedConversationID = destination.id
             selectedSidebar = .workspace(workspace.id)
@@ -1714,7 +1704,12 @@ final class AppModel: ObservableObject {
         }
         var writerLease: ContinuityWorkstreamWriterLease?
         do {
-            guard !(conversation.workflow == .backgroundReview && pending.permission != .readOnly) else {
+            let continuityRole: ContinuityParticipantRole =
+                conversation.workflow == .backgroundReview ? .reviewer : .writer
+            guard ReviewAuthorityService.permits(
+                continuityRole,
+                pending.permission == .workspaceWrite ? .dispatchWriteCapableWork : .prepareReadOnlyReview
+            ) else {
                 throw AppModelError.continuityReviewerMustRemainReadOnly
             }
             if pending.permission == .workspaceWrite,

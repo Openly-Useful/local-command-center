@@ -572,6 +572,211 @@ final class ContinuityStoreTests: XCTestCase {
         XCTAssertTrue(requiresReconciliation)
     }
 
+    func testAcknowledgedHandoffIsSealedAndOnlySupersedes() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let store = try SQLiteStore(databaseURL: location.database)
+        let workspace = Workspace(
+            id: uuid(90), name: "Seal", rootPath: "/seal",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        let conversation = Conversation(
+            id: uuid(91), workspaceID: workspace.id, title: "seal source", provider: .claude,
+            createdAt: date(2), updatedAt: date(2)
+        )
+        let project = try ContinuityProject(
+            id: uuid(92), workspaceID: workspace.id, name: "Seal",
+            createdAt: date(3), updatedAt: date(3)
+        )
+        let link = try ContinuitySessionLink(
+            id: uuid(93), projectID: project.id, conversationID: conversation.id,
+            kind: .primary, createdAt: date(4), updatedAt: date(4)
+        )
+        try await store.upsertWorkspace(workspace)
+        try await store.insertConversation(conversation)
+        try await store.upsertContinuityProject(project)
+        try await store.upsertContinuitySessionLink(link)
+
+        var handoff = try ContinuityHandoff(
+            id: uuid(94), projectID: project.id, sourceSessionLinkID: link.id,
+            title: "Original", summary: "Original summary", state: .draft,
+            createdAt: date(5), updatedAt: date(5)
+        )
+        try await store.upsertContinuityHandoff(handoff)
+
+        // Draft may never seal directly; it must pass through ready.
+        var invalidDirectSeal = handoff
+        invalidDirectSeal.state = .acknowledged
+        do {
+            try await store.upsertContinuityHandoff(invalidDirectSeal)
+            XCTFail("draft -> acknowledged must be rejected")
+        } catch {}
+
+        handoff.state = .ready
+        handoff.summary = "Edited while unsealed"
+        handoff.updatedAt = date(6)
+        try await store.upsertContinuityHandoff(handoff)
+
+        handoff.state = .acknowledged
+        handoff.updatedAt = date(7)
+        try await store.upsertContinuityHandoff(handoff)
+
+        var sealedEdit = handoff
+        sealedEdit.title = "Rewritten"
+        sealedEdit.updatedAt = date(8)
+        do {
+            try await store.upsertContinuityHandoff(sealedEdit)
+            XCTFail("sealed handoff content must be frozen")
+        } catch {}
+
+        var backwards = handoff
+        backwards.state = .ready
+        do {
+            try await store.upsertContinuityHandoff(backwards)
+            XCTFail("acknowledged -> ready must be rejected")
+        } catch {}
+
+        handoff.state = .superseded
+        handoff.updatedAt = date(9)
+        try await store.upsertContinuityHandoff(handoff)
+
+        var afterTerminal = handoff
+        afterTerminal.state = .draft
+        do {
+            try await store.upsertContinuityHandoff(afterTerminal)
+            XCTFail("superseded is terminal")
+        } catch {}
+
+        let persisted = try await store.continuityHandoff(id: handoff.id)
+        XCTAssertEqual(persisted?.state, .superseded)
+        XCTAssertEqual(persisted?.title, "Original")
+        XCTAssertEqual(persisted?.summary, "Edited while unsealed")
+    }
+
+    func testContinuityEventsAreAppendOnly() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let store = try SQLiteStore(databaseURL: location.database)
+        let workspace = Workspace(
+            id: uuid(95), name: "Audit", rootPath: "/audit",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        let project = try ContinuityProject(
+            id: uuid(96), workspaceID: workspace.id, name: "Audit",
+            createdAt: date(2), updatedAt: date(2)
+        )
+        try await store.upsertWorkspace(workspace)
+        try await store.upsertContinuityProject(project)
+
+        let event = try ContinuityEvent(
+            id: uuid(97), projectID: project.id, kind: .note,
+            detail: "First immutable record.", occurredAt: date(3)
+        )
+        try await store.insertContinuityEvent(event)
+
+        let rewrite = try ContinuityEvent(
+            id: uuid(97), projectID: project.id, kind: .note,
+            detail: "Attempted rewrite.", occurredAt: date(4)
+        )
+        do {
+            try await store.insertContinuityEvent(rewrite)
+            XCTFail("audit events must be append-only")
+        } catch {}
+
+        let persisted = try await store.continuityEvent(id: event.id)
+        XCTAssertEqual(persisted?.detail, "First immutable record.")
+        XCTAssertEqual(persisted?.occurredAt, date(3))
+    }
+
+    func testInterruptedContinuityMigrationRollsBackAndRemainsRecoverable() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let workspaceID = uuid(98)
+        let conversationID = uuid(99)
+        let externalID = uuid(100)
+        try createVersionThreeDatabase(
+            at: location.database,
+            workspaceID: workspaceID,
+            conversationID: conversationID,
+            externalID: externalID
+        )
+        // A pre-existing incompatible table makes the v3 -> v4 continuity DDL
+        // fail midway, after earlier CREATE statements have already run.
+        try executeRawSQL(
+            "CREATE TABLE continuity_events (wrong TEXT)",
+            at: location.database
+        )
+
+        XCTAssertThrowsError(try SQLiteStore(databaseURL: location.database))
+
+        XCTAssertEqual(try rawUserVersion(at: location.database), 3)
+        XCTAssertEqual(
+            try rawScalar(
+                "SELECT COUNT(*) FROM conversations",
+                at: location.database
+            ),
+            1,
+            "v3 rows must survive the failed migration"
+        )
+        XCTAssertEqual(
+            try rawScalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'continuity_projects'",
+                at: location.database
+            ),
+            0,
+            "partial continuity DDL must be rolled back"
+        )
+
+        // Operator repair removes the conflict; the migration then completes.
+        try executeRawSQL("DROP TABLE continuity_events", at: location.database)
+        let store = try SQLiteStore(databaseURL: location.database)
+        let configuration = try await store.configuration()
+        let conversation = try await store.conversation(id: conversationID)
+        XCTAssertEqual(configuration.schemaVersion, 4)
+        XCTAssertEqual(conversation?.title, "v3 conversation")
+    }
+
+    private func executeRawSQL(_ sql: String, at databaseURL: URL) throws {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(
+            databaseURL.path,
+            &database,
+            SQLITE_OPEN_READWRITE,
+            nil
+        ) == SQLITE_OK, let database else {
+            throw POSIXError(.EIO)
+        }
+        defer { sqlite3_close_v2(database) }
+        guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
+            throw POSIXError(.EIO)
+        }
+    }
+
+    private func rawUserVersion(at databaseURL: URL) throws -> Int {
+        try rawScalar("PRAGMA user_version", at: databaseURL)
+    }
+
+    private func rawScalar(_ sql: String, at databaseURL: URL) throws -> Int {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(
+            databaseURL.path,
+            &database,
+            SQLITE_OPEN_READONLY,
+            nil
+        ) == SQLITE_OK, let database else {
+            throw POSIXError(.EIO)
+        }
+        defer { sqlite3_close_v2(database) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw POSIXError(.EIO)
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw POSIXError(.EIO) }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
     private func makeExternalSession(id: UUID) throws -> ExternalSession {
         try ExternalSession(
             id: id,

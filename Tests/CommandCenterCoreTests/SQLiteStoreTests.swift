@@ -107,6 +107,62 @@ final class SQLiteStoreTests: XCTestCase {
         XCTAssertEqual(try permissionBits(at: location.database), 0o600)
     }
 
+    func testVersionTwoDatabaseMigratesToLatestWithoutDataLoss() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let workspaceID = UUID(uuidString: "64000000-0000-0000-0000-000000000001")!
+        let conversationID = UUID(uuidString: "65000000-0000-0000-0000-000000000001")!
+        let messageID = UUID(uuidString: "66000000-0000-0000-0000-000000000001")!
+        try createVersionOneDatabase(
+            at: location.database,
+            workspaceID: workspaceID,
+            conversationID: conversationID,
+            messageID: messageID
+        )
+        try promoteVersionOneDatabaseToVersionTwo(at: location.database)
+
+        let migrated = try SQLiteStore(databaseURL: location.database)
+        let configuration = try await migrated.configuration()
+        let storedConversation = try await migrated.conversation(id: conversationID)
+        let conversation = try XCTUnwrap(storedConversation)
+        let messages = try await migrated
+            .listMessages(conversationID: conversationID)
+            .map(\.content)
+        XCTAssertEqual(configuration.schemaVersion, 4)
+        XCTAssertEqual(conversation.title, "preserved v1 conversation")
+        XCTAssertEqual(conversation.skillIDs, ["preserved-v2-skill"])
+        XCTAssertEqual(messages, ["preserved v1 message"])
+
+        let external = try await migrated.externalSession(forConversationID: conversationID)
+        XCTAssertNil(external, "v2 databases have no external links to invent")
+    }
+
+    private func promoteVersionOneDatabaseToVersionTwo(at databaseURL: URL) throws {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(
+            databaseURL.path,
+            &database,
+            SQLITE_OPEN_READWRITE,
+            nil
+        ) == SQLITE_OK, let database else {
+            throw POSIXError(.EIO)
+        }
+        defer { sqlite3_close_v2(database) }
+        let sql = """
+        ALTER TABLE conversations ADD COLUMN skill_ids TEXT NOT NULL DEFAULT '[]'
+            CHECK(length(CAST(skill_ids AS BLOB)) <= 32768);
+        UPDATE conversations SET skill_ids = '["preserved-v2-skill"]';
+        PRAGMA user_version = 2;
+        """
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(database, sql, nil, nil, &errorMessage) == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? "unknown SQLite error"
+            sqlite3_free(errorMessage)
+            XCTFail("Failed to promote fixture to v2: \(message)")
+            throw POSIXError(.EIO)
+        }
+    }
+
     func testDeterministicWorkspaceConversationAndMessageOrdering() async throws {
         let location = makeDatabaseLocation()
         defer { try? FileManager.default.removeItem(at: location.root) }

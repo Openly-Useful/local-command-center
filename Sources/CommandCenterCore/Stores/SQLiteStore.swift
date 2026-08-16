@@ -519,12 +519,14 @@ public actor SQLiteStore {
 
     public func upsertContinuityHandoff(_ handoff: ContinuityHandoff) throws {
         try validateContinuityHandoffReferences(handoff)
-        if let existing = try continuityHandoff(id: handoff.id),
-           existing.projectID != handoff.projectID
+        if let existing = try continuityHandoff(id: handoff.id) {
+            if existing.projectID != handoff.projectID
                 || existing.sourceSessionLinkID != handoff.sourceSessionLinkID {
-            throw SQLiteStoreError.invalidContinuityRelationship(
-                "a handoff cannot change its project or source session"
-            )
+                throw SQLiteStoreError.invalidContinuityRelationship(
+                    "a handoff cannot change its project or source session"
+                )
+            }
+            try Self.validateContinuityHandoffTransition(from: existing, to: handoff)
         }
         try update(
             """
@@ -600,9 +602,34 @@ public actor SQLiteStore {
         }
     }
 
-    public func deleteContinuityHandoff(id: UUID) throws {
-        try update("DELETE FROM continuity_handoffs WHERE id = ?", bindings: [.text(id.uuidString)])
-        try hardenDatabaseArtifacts()
+    /// Handoffs are editable in draft/ready and sealed at acknowledgment.
+    /// Sealed content is frozen; the only legal sealed transition is to
+    /// `superseded`, which is terminal. Corrections create a successor handoff
+    /// rather than rewriting history (ADR-004).
+    private static func validateContinuityHandoffTransition(
+        from existing: ContinuityHandoff,
+        to updated: ContinuityHandoff
+    ) throws {
+        let contentChanged = existing.title != updated.title
+            || existing.summary != updated.summary
+            || existing.destinationSessionLinkID != updated.destinationSessionLinkID
+            || existing.createdAt != updated.createdAt
+        switch (existing.state, updated.state) {
+        case (.draft, .draft), (.draft, .ready), (.ready, .ready), (.ready, .draft),
+             (.draft, .superseded), (.ready, .superseded):
+            return
+        case (.ready, .acknowledged), (.acknowledged, .superseded),
+             (.acknowledged, .acknowledged), (.superseded, .superseded):
+            guard !contentChanged else {
+                throw SQLiteStoreError.invalidContinuityRelationship(
+                    "a sealed handoff cannot change its content; supersede it with a successor"
+                )
+            }
+        default:
+            throw SQLiteStoreError.invalidContinuityRelationship(
+                "invalid handoff state transition \(existing.state.rawValue) -> \(updated.state.rawValue)"
+            )
+        }
     }
 
     /// Events are immutable local audit metadata. Inserting an event never
@@ -672,11 +699,6 @@ public actor SQLiteStore {
                 throw sqliteError()
             }
         }
-    }
-
-    public func deleteContinuityEvent(id: UUID) throws {
-        try update("DELETE FROM continuity_events WHERE id = ?", bindings: [.text(id.uuidString)])
-        try hardenDatabaseArtifacts()
     }
 
     public func upsertContinuitySyncTransaction(_ transaction: ContinuitySyncTransaction) throws {
