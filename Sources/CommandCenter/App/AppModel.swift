@@ -37,6 +37,7 @@ actor ObsidianProjectionCoordinator {
 @MainActor
 final class AppModel: ObservableObject {
     private static let maximumPromptBytes = 256 * 1_024
+    private static let maximumContinuityPromptBytes = maximumPromptBytes + ContinuityCapsuleLimits.contextByteLimit
     private static let maximumQueuedDispatches = 16
     private static let maximumQueuedPromptBytes = 2 * 1_048_576
 
@@ -54,6 +55,12 @@ final class AppModel: ObservableObject {
         var skills: [String]
         var enqueuedAt: Date
         var promptCheckpointed: Bool
+        var continuityHandoffID: UUID?
+    }
+
+    private struct PreparedContinuityDispatch {
+        let prompt: String
+        let handoffID: UUID?
     }
 
     @Published var workspaces: [Workspace] = []
@@ -817,8 +824,27 @@ final class AppModel: ObservableObject {
             alertText = "Choose the other provider for a continuity handoff."
             return
         }
+        guard runningProcesses[source.id] == nil,
+              reservedDispatches[source.id] == nil,
+              !preparingConversationIDs.contains(source.id),
+              !queuedDispatches.contains(where: { $0.conversationID == source.id }),
+              !queueReservations.values.contains(where: { $0.conversationID == source.id }) else {
+            alertText = "Finish or stop the source task before creating a continuity handoff."
+            return
+        }
         let now = Date()
         do {
+            let workspaceURL = URL(fileURLWithPath: workspace.rootPath, isDirectory: true)
+            let sourceLabel = source.provider.displayName
+            let destinationLabel = provider.displayName
+            let preflight = try await Task.detached(priority: .userInitiated) {
+                try ContinuityHandoffPreflight().prepare(
+                    workspaceURL: workspaceURL,
+                    sourceLabel: sourceLabel,
+                    destinationLabel: destinationLabel
+                )
+            }.value
+            let boundarySummary = try preflight.boundary.encodedSummary()
             let existingProject = try await store.listContinuityProjects(workspaceID: workspace.id).first
             let project = try existingProject ?? ContinuityProject(
                 workspaceID: workspace.id,
@@ -843,7 +869,7 @@ final class AppModel: ObservableObject {
                 workflow: reviewOnly ? .backgroundReview : .interactive,
                 permissionMode: .readOnly,
                 status: .idle,
-                skillIDs: source.skillIDs,
+                skillIDs: reviewOnly ? ["engineering:code-review"] : source.skillIDs,
                 createdAt: now,
                 updatedAt: now
             )
@@ -861,12 +887,20 @@ final class AppModel: ObservableObject {
                 sourceSessionLinkID: sourceLink.id,
                 destinationSessionLinkID: destinationLink.id,
                 title: reviewOnly ? "Read-only review of \(source.title)" : "Compact continuation of \(source.title)",
-                summary: "Source provider: \(source.provider.displayName). Source task status: \(source.status.displayName). Continue from the validated repository state and treat provider output as advisory context.",
+                summary: boundarySummary,
                 state: .ready,
                 createdAt: now,
                 updatedAt: now
             )
             try await store.upsertContinuityHandoff(handoff)
+            try await store.insertContinuityEvent(try ContinuityEvent(
+                projectID: project.id,
+                sessionLinkID: destinationLink.id,
+                handoffID: handoff.id,
+                kind: .handoffCreated,
+                detail: "Validated compact handoff prepared at capsule \(preflight.boundary.capsuleDigest.prefix(12)).",
+                occurredAt: now
+            ))
             conversations.insert(destination, at: 0)
             selectedConversationID = destination.id
             selectedSidebar = .workspace(workspace.id)
@@ -874,13 +908,14 @@ final class AppModel: ObservableObject {
             _ = await appendMessage(
                 .system,
                 content: reviewOnly
-                    ? "Read-only reviewer task created for \(provider.displayName). Findings are advisory and cannot write."
-                    : "Compact continuity handoff created for \(provider.displayName). Provider sessions remain separate; continue from the validated repository state.",
+                    ? "Read-only reviewer task created for \(provider.displayName) at capsule \(preflight.boundary.capsuleDigest.prefix(12)). Findings are advisory and cannot write."
+                    : "Compact continuity handoff created for \(provider.displayName) at capsule \(preflight.boundary.capsuleDigest.prefix(12)). Provider sessions remain separate; the repository boundary will be revalidated before the first turn.",
                 conversationID: destination.id
             )
             selectedProvider = provider
-            selectedWorkflow = reviewOnly ? .pairedReview : .direct
+            selectedWorkflow = .direct
             selectedPermission = .readOnly
+            selectedSkills = Set(destination.skillIDs)
         } catch {
             alertText = "Continuity handoff could not be created: \(error.localizedDescription)"
         }
@@ -928,6 +963,80 @@ final class AppModel: ObservableObject {
         isExternalTranscriptLoading = false
     }
 
+    private func prepareContinuityDispatch(
+        conversation: Conversation,
+        userPrompt: String,
+        permission: RuntimePermission
+    ) async throws -> PreparedContinuityDispatch {
+        guard let store,
+              let workspace = workspaces.first(where: { $0.id == conversation.workspaceID }) else {
+            return PreparedContinuityDispatch(prompt: userPrompt, handoffID: nil)
+        }
+
+        var readyHandoff: ContinuityHandoff?
+        for project in try await store.listContinuityProjects(workspaceID: workspace.id) {
+            let destinationLink = try await store.listContinuitySessionLinks(projectID: project.id)
+                .first(where: { $0.conversationID == conversation.id })
+            guard let destinationLink else { continue }
+            readyHandoff = try await store.listContinuityHandoffs(projectID: project.id)
+                .first(where: {
+                    $0.destinationSessionLinkID == destinationLink.id && $0.state == .ready
+                })
+            if readyHandoff != nil { break }
+        }
+        guard let handoff = readyHandoff else {
+            return PreparedContinuityDispatch(prompt: userPrompt, handoffID: nil)
+        }
+        guard permission == .readOnly else {
+            throw AppModelError.continuityFirstTurnMustBeReadOnly
+        }
+
+        let boundary = try ContinuityHandoffBoundary.decode(summary: handoff.summary)
+        let workspaceURL = URL(fileURLWithPath: workspace.rootPath, isDirectory: true)
+        let capsulePrompt = try await Task.detached(priority: .userInitiated) {
+            try ContinuityHandoffPreflight().revalidate(
+                boundary: boundary,
+                workspaceURL: workspaceURL
+            )
+        }.value
+        let combined = """
+        \(capsulePrompt)
+        BEGIN CURRENT USER DIRECTION
+        \(userPrompt)
+        END CURRENT USER DIRECTION
+        """
+        guard combined.utf8.count <= Self.maximumContinuityPromptBytes else {
+            throw AppModelError.continuityPromptTooLarge
+        }
+        return PreparedContinuityDispatch(prompt: combined, handoffID: handoff.id)
+    }
+
+    private func acknowledgeContinuityHandoff(
+        _ handoffID: UUID,
+        conversationID: UUID
+    ) async throws {
+        guard let store, var handoff = try await store.continuityHandoff(id: handoffID) else {
+            throw AppModelError.persistenceRequired
+        }
+        guard handoff.state == .ready else { return }
+        let now = Date()
+        handoff.state = .acknowledged
+        handoff.updatedAt = now
+        try await store.upsertContinuityHandoff(handoff)
+        try await store.insertContinuityEvent(try ContinuityEvent(
+            projectID: handoff.projectID,
+            handoffID: handoff.id,
+            kind: .handoffStateChanged,
+            detail: "Destination task acknowledged the validated compact handoff.",
+            occurredAt: now
+        ))
+        _ = await appendMessage(
+            .system,
+            content: "Validated compact handoff supplied once; later turns use only new user direction and provider-native context.",
+            conversationID: conversationID
+        )
+    }
+
     func dispatchComposer() async {
         guard selectedSidebar.supportsConversationDispatch else {
             alertText = "Open an app-owned task before running a prompt. Local history, Skills, and Runtime are non-dispatch surfaces."
@@ -972,6 +1081,18 @@ final class AppModel: ObservableObject {
         }
         preparingConversationIDs.insert(conversation.id)
         defer { preparingConversationIDs.remove(conversation.id) }
+        let continuityDispatch: PreparedContinuityDispatch
+        do {
+            continuityDispatch = try await prepareContinuityDispatch(
+                conversation: conversation,
+                userPrompt: prompt,
+                permission: dispatchPermission
+            )
+        } catch {
+            alertText = error.localizedDescription
+            activityText = "Continuity preflight blocked"
+            return
+        }
         guard await appendMessage(.user, content: prompt, conversationID: conversation.id) != nil else {
             activityText = "Prompt checkpoint failed"
             return
@@ -991,14 +1112,15 @@ final class AppModel: ObservableObject {
         let pending = PendingDispatch(
             id: UUID(),
             conversationID: targetConversationID,
-            prompt: prompt,
+            prompt: continuityDispatch.prompt,
             provider: dispatchProvider,
             workflow: dispatchWorkflow,
             classification: dispatchWorkflow.workflowKind,
             permission: dispatchPermission,
             skills: dispatchSkills,
             enqueuedAt: Date(),
-            promptCheckpointed: true
+            promptCheckpointed: true,
+            continuityHandoffID: continuityDispatch.handoffID
         )
         if dispatchWorkflow == .pairedReview {
             pairedReviewPrimaries.insert(targetConversationID)
@@ -1162,6 +1284,17 @@ final class AppModel: ObservableObject {
                 handoff.accept(event)
             }
             runningProcesses[pending.conversationID] = running
+            if let handoffID = pending.continuityHandoffID {
+                do {
+                    try await acknowledgeContinuityHandoff(
+                        handoffID,
+                        conversationID: pending.conversationID
+                    )
+                } catch {
+                    running.cancel()
+                    throw AppModelError.persistenceRequired
+                }
+            }
             reservedDispatches.removeValue(forKey: pending.conversationID)
             activityText = "\(pending.provider.displayName) running · \(pending.workflow.displayName)"
         } catch {
@@ -1270,7 +1403,8 @@ final class AppModel: ObservableObject {
                 permission: .readOnly,
                 skills: ["engineering:code-review"],
                 enqueuedAt: Date(),
-                promptCheckpointed: false
+                promptCheckpointed: false,
+                continuityHandoffID: nil
             )
             await admitOrQueue(pending)
         } catch {
@@ -1541,8 +1675,17 @@ final class AppModel: ObservableObject {
 
 enum AppModelError: LocalizedError {
     case persistenceRequired
+    case continuityFirstTurnMustBeReadOnly
+    case continuityPromptTooLarge
 
     var errorDescription: String? {
-        "The turn was not started because its local checkpoint could not be saved."
+        switch self {
+        case .persistenceRequired:
+            "The turn was not started because its local checkpoint could not be saved."
+        case .continuityFirstTurnMustBeReadOnly:
+            "The first destination turn must remain read-only while it validates the continuity capsule."
+        case .continuityPromptTooLarge:
+            "The continuity capsule and current direction exceed the bounded provider prompt limit."
+        }
     }
 }
