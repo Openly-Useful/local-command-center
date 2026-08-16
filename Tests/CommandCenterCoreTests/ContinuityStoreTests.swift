@@ -266,7 +266,279 @@ final class ContinuityStoreTests: XCTestCase {
         XCTAssertEqual(conversation?.title, "v3 conversation")
         XCTAssertEqual(external?.id, externalID)
         let migratedProject = try await store.continuityProject(id: project.id)
+        let migratedLease = try await store.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id,
+            workstreamID: uuid(34),
+            ownerID: uuid(35),
+            now: date(201),
+            duration: 60
+        )
         XCTAssertEqual(migratedProject, project)
+        XCTAssertEqual(migratedLease?.workstreamID, uuid(34))
+    }
+
+    func testWorkstreamReconciliationMarkerSurvivesReopenAndRequiresAuditedClear() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let store = try SQLiteStore(databaseURL: location.database)
+        let workspace = Workspace(
+            id: uuid(40), name: "Lease recovery", rootPath: "/lease-recovery",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        let project = try ContinuityProject(
+            id: uuid(41), workspaceID: workspace.id, name: "Lease recovery",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        try await store.upsertWorkspace(workspace)
+        try await store.upsertContinuityProject(project)
+        let workstreamID = uuid(42)
+        let owner = uuid(43)
+        _ = try await store.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: owner,
+            now: date(10), duration: 60
+        )
+        let marked = try await store.requireContinuityWorkstreamReconciliation(
+            projectID: project.id,
+            workstreamID: workstreamID,
+            reason: "Lost writer ownership after a silent process heartbeat."
+        )
+        XCTAssertTrue(marked)
+        let markedRevisionValue = try await store.continuityWorkstreamWriterLeaseRevision(
+            projectID: project.id, workstreamID: workstreamID
+        )
+        let markedRevision = try XCTUnwrap(markedRevisionValue)
+
+        let reopened = try SQLiteStore(databaseURL: location.database)
+        let requiresReconciliation = try await reopened.continuityWorkstreamRequiresReconciliation(
+            projectID: project.id, workstreamID: workstreamID
+        )
+        XCTAssertTrue(requiresReconciliation)
+        let deniedAfterExpiry = try await reopened.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: uuid(44),
+            now: date(100), duration: 60
+        )
+        XCTAssertNil(deniedAfterExpiry)
+
+        let evidence = try ContinuityWorkstreamReconciliationEvidence(
+            capsuleDigest: String(repeating: "a", count: 64),
+            workspaceDigest: String(repeating: "b", count: 64),
+            auditEvidenceID: "ev_audit-verified-42"
+        )
+        let reconciled = try await reopened.reconcileContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, evidence: evidence, at: date(100)
+        )
+        XCTAssertTrue(reconciled)
+        let stillRequiresReconciliation = try await reopened.continuityWorkstreamRequiresReconciliation(
+            projectID: project.id, workstreamID: workstreamID
+        )
+        XCTAssertFalse(stillRequiresReconciliation)
+        let reconciledRevisionValue = try await reopened.continuityWorkstreamWriterLeaseRevision(
+            projectID: project.id, workstreamID: workstreamID
+        )
+        let reconciledRevision = try XCTUnwrap(reconciledRevisionValue)
+        XCTAssertGreaterThan(reconciledRevision, markedRevision)
+        let recoveredLease = try await reopened.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: uuid(44),
+            now: date(101), duration: 60
+        )
+        XCTAssertNotNil(recoveredLease)
+    }
+
+    func testFailedReleaseCanBePersistedAsReconciliationRequired() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let store = try SQLiteStore(databaseURL: location.database)
+        let workspace = Workspace(
+            id: uuid(50), name: "Release failure", rootPath: "/release-failure",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        let project = try ContinuityProject(
+            id: uuid(51), workspaceID: workspace.id, name: "Release failure",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        try await store.upsertWorkspace(workspace)
+        try await store.upsertContinuityProject(project)
+        let workstreamID = uuid(52)
+        _ = try await store.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: uuid(53),
+            now: date(10), duration: 60
+        )
+        let released = try await store.releaseContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: uuid(54), at: date(11)
+        )
+        XCTAssertFalse(released)
+        let marked = try await store.requireContinuityWorkstreamReconciliation(
+            projectID: project.id,
+            workstreamID: workstreamID,
+            reason: "Provider exit did not verify writer lease release."
+        )
+        XCTAssertTrue(marked)
+        let requiresReconciliation = try await store.continuityWorkstreamRequiresReconciliation(
+            projectID: project.id, workstreamID: workstreamID
+        )
+        XCTAssertTrue(requiresReconciliation)
+    }
+
+    func testExpiredWriterLeaseRequiresAuditedRecoveryBeforeAnyOwnerCanAcquire() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let store = try SQLiteStore(databaseURL: location.database)
+        let workspace = Workspace(
+            id: uuid(70), name: "Expired writer", rootPath: "/expired-writer",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        let project = try ContinuityProject(
+            id: uuid(71), workspaceID: workspace.id, name: "Expired writer",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        try await store.upsertWorkspace(workspace)
+        try await store.upsertContinuityProject(project)
+        let workstreamID = uuid(72)
+        let originalOwner = uuid(73)
+        let initial = try await store.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: originalOwner,
+            now: date(10), duration: 60
+        )
+        XCTAssertNotNil(initial)
+
+        let expiredSameOwner = try await store.renewContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: originalOwner,
+            now: date(70), duration: 60
+        )
+        XCTAssertNil(expiredSameOwner)
+        let markedAfterExpiredRenewal = try await store.continuityWorkstreamRequiresReconciliation(
+            projectID: project.id, workstreamID: workstreamID
+        )
+        XCTAssertTrue(markedAfterExpiredRenewal)
+
+        let differentOwnerWorkstreamID = uuid(74)
+        _ = try await store.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: differentOwnerWorkstreamID, ownerID: uuid(75),
+            now: date(10), duration: 60
+        )
+        let expiredDifferentOwner = try await store.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: differentOwnerWorkstreamID, ownerID: uuid(76),
+            now: date(70), duration: 60
+        )
+        XCTAssertNil(expiredDifferentOwner)
+        let markerAfterDifferentOwnerAttempt = try await store.continuityWorkstreamRequiresReconciliation(
+            projectID: project.id, workstreamID: differentOwnerWorkstreamID
+        )
+        XCTAssertTrue(markerAfterDifferentOwnerAttempt)
+
+        let reopened = try SQLiteStore(databaseURL: location.database)
+        let markerSurvivedReopen = try await reopened.continuityWorkstreamRequiresReconciliation(
+            projectID: project.id, workstreamID: workstreamID
+        )
+        XCTAssertTrue(markerSurvivedReopen)
+        let evidence = try ContinuityWorkstreamReconciliationEvidence(
+            capsuleDigest: String(repeating: "c", count: 64),
+            workspaceDigest: String(repeating: "d", count: 64),
+            auditEvidenceID: "ev_expired-lease-audit"
+        )
+        let reconciled = try await reopened.reconcileContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, evidence: evidence, at: date(72)
+        )
+        XCTAssertTrue(reconciled)
+        let recoveredLease = try await reopened.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: uuid(77),
+            now: date(73), duration: 60
+        )
+        XCTAssertNotNil(recoveredLease)
+    }
+
+    func testExpiredLeaseReleaseMarksReconciliationAndSurvivesReopen() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let store = try SQLiteStore(databaseURL: location.database)
+        let workspace = Workspace(
+            id: uuid(80), name: "Expired release", rootPath: "/expired-release",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        let project = try ContinuityProject(
+            id: uuid(81), workspaceID: workspace.id, name: "Expired release",
+            createdAt: date(1), updatedAt: date(1)
+        )
+        try await store.upsertWorkspace(workspace)
+        try await store.upsertContinuityProject(project)
+        let workstreamID = uuid(82)
+        let owner = uuid(83)
+        _ = try await store.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: owner,
+            now: date(10), duration: 60
+        )
+
+        let releasedAfterExpiry = try await store.releaseContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: owner, at: date(70)
+        )
+        XCTAssertFalse(releasedAfterExpiry)
+        let reopened = try SQLiteStore(databaseURL: location.database)
+        let markerSurvivedReopen = try await reopened.continuityWorkstreamRequiresReconciliation(
+            projectID: project.id, workstreamID: workstreamID
+        )
+        XCTAssertTrue(markerSurvivedReopen)
+        let deniedAcquire = try await reopened.acquireContinuityWorkstreamWriterLease(
+            projectID: project.id, workstreamID: workstreamID, ownerID: uuid(84),
+            now: date(71), duration: 60
+        )
+        XCTAssertNil(deniedAcquire)
+    }
+
+    func testReconciliationEvidenceRejectsPathsSessionsAndSecretLikeValues() throws {
+        let digest = String(repeating: "a", count: 64)
+        XCTAssertNoThrow(try ContinuityWorkstreamReconciliationEvidence(
+            capsuleDigest: digest,
+            workspaceDigest: digest,
+            auditEvidenceID: "ev_audit-verified.42"
+        ))
+        XCTAssertNoThrow(try ContinuityWorkstreamReconciliationEvidence(
+            capsuleDigest: digest,
+            workspaceDigest: digest,
+            auditEvidenceID: "ev_profile-audit"
+        ))
+        for invalidID in [
+            "/private/transcript.jsonl",
+            "file:///private/audit.json",
+            "ev_session_123",
+            "ev_transcript_123",
+            "ev_/private/audit",
+            "sk_live_1234567890",
+            "ev_sk_live_1234567890",
+            "ev_audit\n123",
+        ] {
+            XCTAssertThrowsError(try ContinuityWorkstreamReconciliationEvidence(
+                capsuleDigest: digest,
+                workspaceDigest: digest,
+                auditEvidenceID: invalidID
+            ), "Expected \(invalidID) to be rejected")
+        }
+    }
+
+    func testExistingVersionFourLeaseTableGainsReconciliationColumns() async throws {
+        let location = makeDatabaseLocation()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let workspaceID = uuid(60)
+        let projectID = uuid(61)
+        let workstreamID = uuid(62)
+        try createLegacyVersionFourWorkstreamLeaseDatabase(
+            at: location.database,
+            workspaceID: workspaceID,
+            projectID: projectID,
+            workstreamID: workstreamID
+        )
+
+        let store = try SQLiteStore(databaseURL: location.database)
+        let marked = try await store.requireContinuityWorkstreamReconciliation(
+            projectID: projectID,
+            workstreamID: workstreamID,
+            reason: "Existing v4 lease requires an explicit continuity audit."
+        )
+        XCTAssertTrue(marked)
+        let requiresReconciliation = try await store.continuityWorkstreamRequiresReconciliation(
+            projectID: projectID,
+            workstreamID: workstreamID
+        )
+        XCTAssertTrue(requiresReconciliation)
     }
 
     private func makeExternalSession(id: UUID) throws -> ExternalSession {
@@ -394,6 +666,58 @@ final class ContinuityStoreTests: XCTestCase {
             let message = errorMessage.map { String(cString: $0) } ?? "unknown SQLite error"
             sqlite3_free(errorMessage)
             XCTFail("Failed to create v3 fixture: \(message)")
+            throw POSIXError(.EIO)
+        }
+    }
+
+    private func createLegacyVersionFourWorkstreamLeaseDatabase(
+        at databaseURL: URL,
+        workspaceID: UUID,
+        projectID: UUID,
+        workstreamID: UUID
+    ) throws {
+        try FileManager.default.createDirectory(
+            at: databaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(
+            databaseURL.path,
+            &database,
+            SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE,
+            nil
+        ) == SQLITE_OK, let database else {
+            throw POSIXError(.EIO)
+        }
+        defer { sqlite3_close_v2(database) }
+        let sql = """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE workspaces (
+            id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, root_path TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL, updated_at REAL NOT NULL
+        );
+        CREATE TABLE continuity_projects (
+            id TEXT PRIMARY KEY NOT NULL,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            name TEXT NOT NULL, summary TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+        );
+        CREATE TABLE continuity_workstream_writer_leases (
+            project_id TEXT NOT NULL REFERENCES continuity_projects(id) ON DELETE CASCADE,
+            workstream_id TEXT NOT NULL, owner_token TEXT, lease_expires_at REAL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(project_id, workstream_id), UNIQUE(workstream_id)
+        );
+        INSERT INTO workspaces VALUES ('\(workspaceID.uuidString)', 'v4 workspace', '/v4', 1, 1);
+        INSERT INTO continuity_projects VALUES ('\(projectID.uuidString)', '\(workspaceID.uuidString)', 'v4 project', NULL, 1, 1);
+        INSERT INTO continuity_workstream_writer_leases VALUES ('\(projectID.uuidString)', '\(workstreamID.uuidString)', NULL, NULL, 1);
+        PRAGMA user_version = 4;
+        """
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(database, sql, nil, nil, &errorMessage)
+        guard result == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? "unknown SQLite error"
+            sqlite3_free(errorMessage)
+            XCTFail("Failed to create v4 writer lease fixture: \(message)")
             throw POSIXError(.EIO)
         }
     }

@@ -40,6 +40,7 @@ final class AppModel: ObservableObject {
     private static let maximumContinuityPromptBytes = maximumPromptBytes + ContinuityCapsuleLimits.contextByteLimit
     private static let maximumQueuedDispatches = 16
     private static let maximumQueuedPromptBytes = 2 * 1_048_576
+    private static let continuityWriterHeartbeatNanoseconds: UInt64 = 120 * 1_000_000_000
 
     struct PendingDispatch {
         var id: UUID
@@ -61,6 +62,16 @@ final class AppModel: ObservableObject {
     private struct PreparedContinuityDispatch {
         let prompt: String
         let handoffID: UUID?
+    }
+
+    private enum ContinuityWriterHandoffRole {
+        case source
+        case destination
+    }
+
+    private struct ContinuityWriterHandoff {
+        let handoff: ContinuityHandoff
+        let role: ContinuityWriterHandoffRole
     }
 
     @Published var workspaces: [Workspace] = []
@@ -114,6 +125,10 @@ final class AppModel: ObservableObject {
     private var reservedDispatches: [UUID: PendingDispatch] = [:]
     private var queuedDispatches: [PendingDispatch] = []
     private var queueReservations: [UUID: PendingDispatch] = [:]
+    /// Local-only process ownership. The durable lease itself remains in
+    /// SQLite, so a crashed app can recover safely after its bounded expiry.
+    private var continuityWriterLeases: [UUID: ContinuityWorkstreamWriterLease] = [:]
+    private var continuityWriterHeartbeatTasks: [UUID: Task<Void, Never>] = [:]
     private var preparingConversationIDs: Set<UUID> = []
     private var pairedReviewPrimaries: Set<UUID> = []
     private var lastAssistantText: [UUID: String] = [:]
@@ -973,18 +988,17 @@ final class AppModel: ObservableObject {
             return PreparedContinuityDispatch(prompt: userPrompt, handoffID: nil)
         }
 
-        var readyHandoff: ContinuityHandoff?
+        var readyHandoffs: [ContinuityHandoff] = []
         for project in try await store.listContinuityProjects(workspaceID: workspace.id) {
-            let destinationLink = try await store.listContinuitySessionLinks(projectID: project.id)
-                .first(where: { $0.conversationID == conversation.id })
-            guard let destinationLink else { continue }
-            readyHandoff = try await store.listContinuityHandoffs(projectID: project.id)
-                .first(where: {
-                    $0.destinationSessionLinkID == destinationLink.id && $0.state == .ready
-                })
-            if readyHandoff != nil { break }
+            let destinationIDs = Set(try await store.listContinuitySessionLinks(projectID: project.id)
+                .filter { $0.conversationID == conversation.id }
+                .map(\.id))
+            guard !destinationIDs.isEmpty else { continue }
+            readyHandoffs.append(contentsOf: try await store.listContinuityHandoffs(projectID: project.id)
+                .filter { $0.destinationSessionLinkID.map(destinationIDs.contains) == true && $0.state == .ready })
         }
-        guard let handoff = readyHandoff else {
+        guard readyHandoffs.count <= 1 else { throw AppModelError.continuityWriterAmbiguous }
+        guard let handoff = readyHandoffs.first else {
             return PreparedContinuityDispatch(prompt: userPrompt, handoffID: nil)
         }
         guard permission == .readOnly else {
@@ -1035,6 +1049,146 @@ final class AppModel: ObservableObject {
             content: "Validated compact handoff supplied once; later turns use only new user direction and provider-native context.",
             conversationID: conversationID
         )
+    }
+
+    /// Returns the one continuity handoff that owns this destination task.
+    /// Multiple candidates are a ledger conflict, not an invitation to choose
+    /// whichever happened to sort first.
+    private func continuityHandoffForWriterLease(
+        conversationID: UUID,
+        workspaceID: UUID,
+        preferredHandoffID: UUID?
+    ) async throws -> ContinuityWriterHandoff? {
+        guard let store else { return nil }
+        if let preferredHandoffID {
+            guard let handoff = try await store.continuityHandoff(id: preferredHandoffID) else {
+                throw AppModelError.continuityWriterAmbiguous
+            }
+            let projects = try await store.listContinuityProjects(workspaceID: workspaceID)
+            guard projects.contains(where: { $0.id == handoff.projectID }),
+                  let destinationLinkID = handoff.destinationSessionLinkID,
+                  let destinationLink = try await store.continuitySessionLink(id: destinationLinkID),
+                  destinationLink.conversationID == conversationID else {
+                throw AppModelError.continuityWriterAmbiguous
+            }
+            return ContinuityWriterHandoff(handoff: handoff, role: .destination)
+        }
+
+        var candidates: [ContinuityWriterHandoff] = []
+        for project in try await store.listContinuityProjects(workspaceID: workspaceID) {
+            let destinationLinks = try await store.listContinuitySessionLinks(projectID: project.id)
+                .filter { $0.conversationID == conversationID }
+            guard !destinationLinks.isEmpty else { continue }
+            let destinationIDs = Set(destinationLinks.map(\.id))
+            for handoff in try await store.listContinuityHandoffs(projectID: project.id) {
+                guard handoff.state == .ready || handoff.state == .acknowledged else { continue }
+                if destinationIDs.contains(handoff.sourceSessionLinkID) {
+                    candidates.append(ContinuityWriterHandoff(handoff: handoff, role: .source))
+                }
+                if handoff.destinationSessionLinkID.map(destinationIDs.contains) == true {
+                    candidates.append(ContinuityWriterHandoff(handoff: handoff, role: .destination))
+                }
+            }
+        }
+        guard candidates.count <= 1 else { throw AppModelError.continuityWriterAmbiguous }
+        return candidates.first
+    }
+
+    private func renewContinuityWriterLease(for conversationID: UUID) async {
+        guard let store, let lease = continuityWriterLeases[conversationID] else { return }
+        do {
+            guard let renewed = try await ContinuityWriterLeaseGate.renew(store: store, lease: lease) else {
+                await requireContinuityReconciliation(
+                    for: conversationID,
+                    lease: lease,
+                    reason: "Writer lease renewal lost ownership while the provider process remained live."
+                )
+                return
+            }
+            continuityWriterLeases[conversationID] = renewed
+        } catch {
+            await requireContinuityReconciliation(
+                for: conversationID,
+                lease: lease,
+                reason: "Writer lease renewal could not be verified while the provider process remained live."
+            )
+        }
+    }
+
+    private func requireContinuityReconciliation(
+        for conversationID: UUID,
+        lease: ContinuityWorkstreamWriterLease,
+        reason: String
+    ) async {
+        continuityWriterHeartbeatTasks.removeValue(forKey: conversationID)?.cancel()
+        guard let store else {
+            alertText = "Continuity writer ownership could not be persisted for reconciliation."
+            return
+        }
+        do {
+            guard try await ContinuityWriterLeaseGate.requireReconciliation(
+                store: store,
+                lease: lease,
+                reason: reason
+            ) else {
+                throw AppModelError.continuityWriterLeaseLost
+            }
+            try await store.insertContinuityEvent(try ContinuityEvent(
+                projectID: lease.projectID,
+                handoffID: lease.workstreamID,
+                kind: .note,
+                detail: "Writer ownership requires explicit reconciliation before another writable launch."
+            ))
+            alertText = "Continuity writer ownership requires reconciliation before another writable launch."
+        } catch {
+            alertText = "Continuity writer ownership could not be persisted for reconciliation: \(error.localizedDescription)"
+        }
+    }
+
+    private func startContinuityWriterHeartbeat(for conversationID: UUID) {
+        continuityWriterHeartbeatTasks[conversationID]?.cancel()
+        continuityWriterHeartbeatTasks[conversationID] = ContinuityWriterLeaseHeartbeat.start(
+            intervalNanoseconds: Self.continuityWriterHeartbeatNanoseconds
+        ) { [weak self] in
+            await self?.renewContinuityWriterLease(for: conversationID)
+        }
+    }
+
+    private func releaseContinuityWriterLease(
+        for conversationID: UUID,
+        succeeded: Bool
+    ) async {
+        continuityWriterHeartbeatTasks.removeValue(forKey: conversationID)?.cancel()
+        guard let store, let lease = continuityWriterLeases.removeValue(forKey: conversationID) else {
+            return
+        }
+        do {
+            guard try await ContinuityWriterLeaseGate.release(
+                store: store,
+                lease: lease
+            ) else {
+                await requireContinuityReconciliation(
+                    for: conversationID,
+                    lease: lease,
+                    reason: "Provider process exited without a verified writer lease release."
+                )
+                return
+            }
+            try await store.insertContinuityEvent(try ContinuityEvent(
+                projectID: lease.projectID,
+                handoffID: lease.workstreamID,
+                kind: .note,
+                detail: succeeded
+                    ? "Exclusive writer lease released after provider completion."
+                    : "Exclusive writer lease released after provider failure or cancellation."
+            ))
+        } catch {
+            await requireContinuityReconciliation(
+                for: conversationID,
+                lease: lease,
+                reason: "Provider process exited and writer lease release could not be verified."
+            )
+        }
     }
 
     func dispatchComposer() async {
@@ -1140,6 +1294,10 @@ final class AppModel: ObservableObject {
 
     func shutdown() {
         Task { await historyCoordinator.cancel() }
+        for heartbeat in continuityWriterHeartbeatTasks.values {
+            heartbeat.cancel()
+        }
+        continuityWriterHeartbeatTasks.removeAll()
         for (conversationID, process) in runningProcesses {
             cancellationRequestedIDs.insert(conversationID)
             process.cancel()
@@ -1247,7 +1405,45 @@ final class AppModel: ObservableObject {
             pairedReviewPrimaries.remove(pending.conversationID)
             return
         }
+        var writerLease: ContinuityWorkstreamWriterLease?
         do {
+            guard !(conversation.workflow == .backgroundReview && pending.permission != .readOnly) else {
+                throw AppModelError.continuityReviewerMustRemainReadOnly
+            }
+            if pending.permission == .workspaceWrite,
+               let writerHandoff = try await continuityHandoffForWriterLease(
+                   conversationID: conversation.id,
+                   workspaceID: workspace.id,
+                   preferredHandoffID: pending.continuityHandoffID
+               ) {
+                guard let store else { throw AppModelError.persistenceRequired }
+                let handoff = writerHandoff.handoff
+                if writerHandoff.role == .source {
+                    try await store.insertContinuityEvent(try ContinuityEvent(
+                        projectID: handoff.projectID,
+                        handoffID: handoff.id,
+                        kind: .note,
+                        detail: "Source task attempted a writable turn after its handoff boundary. Reconciliation is required."
+                    ))
+                    throw AppModelError.continuitySourceDivergent
+                }
+                guard let acquired = try await ContinuityWriterLeaseGate.acquireIfWritable(
+                    store: store,
+                    projectID: handoff.projectID,
+                    handoffID: handoff.id,
+                    permission: pending.permission,
+                    ownerID: pending.id
+                ) else {
+                    throw AppModelError.continuityWriterConflict
+                }
+                writerLease = acquired
+                try await store.insertContinuityEvent(try ContinuityEvent(
+                    projectID: handoff.projectID,
+                    handoffID: handoff.id,
+                    kind: .note,
+                    detail: "Exclusive writer lease acquired for a continuity workstream."
+                ))
+            }
             let plan = try ProviderCommandBuilder.build(
                 provider: pending.provider,
                 workspaceURL: URL(fileURLWithPath: workspace.rootPath, isDirectory: true),
@@ -1284,6 +1480,11 @@ final class AppModel: ObservableObject {
                 handoff.accept(event)
             }
             runningProcesses[pending.conversationID] = running
+            if let acquiredWriterLease = writerLease {
+                continuityWriterLeases[pending.conversationID] = acquiredWriterLease
+                startContinuityWriterHeartbeat(for: pending.conversationID)
+                writerLease = nil
+            }
             if let handoffID = pending.continuityHandoffID {
                 do {
                     try await acknowledgeContinuityHandoff(
@@ -1298,6 +1499,24 @@ final class AppModel: ObservableObject {
             reservedDispatches.removeValue(forKey: pending.conversationID)
             activityText = "\(pending.provider.displayName) running · \(pending.workflow.displayName)"
         } catch {
+            if let store, let writerLease {
+                do {
+                    let released = try await ContinuityWriterLeaseGate.release(store: store, lease: writerLease)
+                    if !released {
+                        await requireContinuityReconciliation(
+                            for: pending.conversationID,
+                            lease: writerLease,
+                            reason: "Provider launch failed and writer lease release could not be verified."
+                        )
+                    }
+                } catch {
+                    await requireContinuityReconciliation(
+                        for: pending.conversationID,
+                        lease: writerLease,
+                        reason: "Provider launch failed and writer lease release could not be persisted."
+                    )
+                }
+            }
             reservedDispatches.removeValue(forKey: pending.conversationID)
             pairedReviewPrimaries.remove(pending.conversationID)
             _ = await appendMessage(.tool, content: error.localizedDescription, conversationID: conversation.id)
@@ -1308,6 +1527,11 @@ final class AppModel: ObservableObject {
     }
 
     private func handle(_ event: ProviderStreamEvent, conversationID: UUID) async {
+        if case .exited = event {
+            // Completion below owns lease release for a process that started.
+        } else {
+            await renewContinuityWriterLease(for: conversationID)
+        }
         switch event {
         case .batch(let events):
             for event in events {
@@ -1360,6 +1584,10 @@ final class AppModel: ObservableObject {
             let wasCancelled = cancellationRequestedIDs.remove(conversationID) != nil
             let shouldLaunchPairedReview = pairedReviewPrimaries.remove(conversationID) != nil
             let finalStatus: ConversationStatus = wasCancelled ? .cancelled : (status == 0 ? .completed : .failed)
+            await releaseContinuityWriterLease(
+                for: conversationID,
+                succeeded: !wasCancelled && status == 0
+            )
             await setStatus(finalStatus, for: conversationID)
             activityText = wasCancelled
                 ? "Cancelled"
@@ -1677,6 +1905,11 @@ enum AppModelError: LocalizedError {
     case persistenceRequired
     case continuityFirstTurnMustBeReadOnly
     case continuityPromptTooLarge
+    case continuityWriterConflict
+    case continuityWriterAmbiguous
+    case continuityWriterLeaseLost
+    case continuityReviewerMustRemainReadOnly
+    case continuitySourceDivergent
 
     var errorDescription: String? {
         switch self {
@@ -1686,6 +1919,16 @@ enum AppModelError: LocalizedError {
             "The first destination turn must remain read-only while it validates the continuity capsule."
         case .continuityPromptTooLarge:
             "The continuity capsule and current direction exceed the bounded provider prompt limit."
+        case .continuityWriterConflict:
+            "Another active writer owns this continuity workstream. Wait for it to finish or reconcile the handoff before retrying."
+        case .continuityWriterAmbiguous:
+            "The destination task has conflicting continuity handoffs. Audit and reconcile the lineage before launching a writer."
+        case .continuityWriterLeaseLost:
+            "Continuity writer ownership was lost or expired. Audit the workstream before launching another writer."
+        case .continuityReviewerMustRemainReadOnly:
+            "Reviewer tasks are read-only and cannot acquire a continuity writer lease."
+        case .continuitySourceDivergent:
+            "The source task advanced after its handoff boundary. Reconcile the divergent branches before another writable turn."
         }
     }
 }

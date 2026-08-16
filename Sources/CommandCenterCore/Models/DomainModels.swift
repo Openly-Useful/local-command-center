@@ -579,6 +579,110 @@ public struct ContinuityWriterLease: Codable, Equatable, Sendable {
     }
 }
 
+/// Opaque, local-only ownership for one writable continuity workstream.
+///
+/// This is deliberately distinct from `ContinuityWriterLease`, which protects
+/// tracker synchronization transactions. A provider execution lease is keyed
+/// by the app's durable workstream identifier (Phase 1 uses a handoff ID).
+public struct ContinuityWorkstreamWriterLease: Codable, Equatable, Sendable {
+    public let projectID: UUID
+    public let workstreamID: UUID
+    public let ownerID: UUID
+    public let expiresAt: Date
+    public let revision: Int64
+
+    public init(
+        projectID: UUID,
+        workstreamID: UUID,
+        ownerID: UUID,
+        expiresAt: Date,
+        revision: Int64
+    ) throws {
+        try ContinuityValidation.validateDate(expiresAt, field: "expiresAt")
+        guard revision >= 0 else { throw ContinuityValidationError.negativeRevision(revision) }
+        self.projectID = projectID
+        self.workstreamID = workstreamID
+        self.ownerID = ownerID
+        self.expiresAt = expiresAt
+        self.revision = revision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case projectID, workstreamID, ownerID, expiresAt, revision
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            projectID: try values.decode(UUID.self, forKey: .projectID),
+            workstreamID: try values.decode(UUID.self, forKey: .workstreamID),
+            ownerID: try values.decode(UUID.self, forKey: .ownerID),
+            expiresAt: try values.decode(Date.self, forKey: .expiresAt),
+            revision: try values.decode(Int64.self, forKey: .revision)
+        )
+    }
+}
+
+/// Compact, validated evidence required before an operator can clear a
+/// workstream's fail-closed reconciliation marker. It contains digests and an
+/// audit reference only—never a local path, provider session ID, or transcript.
+public struct ContinuityWorkstreamReconciliationEvidence: Codable, Equatable, Sendable {
+    public let capsuleDigest: String
+    public let workspaceDigest: String
+    public let auditEvidenceID: String
+
+    public init(capsuleDigest: String, workspaceDigest: String, auditEvidenceID: String) throws {
+        self.capsuleDigest = try Self.digest(capsuleDigest, field: "capsuleDigest")
+        self.workspaceDigest = try Self.digest(workspaceDigest, field: "workspaceDigest")
+        self.auditEvidenceID = try Self.auditEvidenceID(auditEvidenceID)
+    }
+
+    var storageValue: String {
+        "\(capsuleDigest)|\(workspaceDigest)|\(auditEvidenceID)"
+    }
+
+    private static func digest(_ value: String, field: String) throws -> String {
+        let canonical = try ContinuityValidation.requiredText(value, field: field, maximumBytes: 64)
+        let isSHA256 = canonical.count == 64 && canonical.unicodeScalars.allSatisfy {
+            (48 ... 57).contains($0.value) || (97 ... 102).contains($0.value)
+        }
+        guard isSHA256 else { throw ContinuityValidationError.empty(field: "valid \(field)") }
+        return canonical
+    }
+
+    /// Reconciliation evidence is an opaque ledger key, not a description or
+    /// reference to provider-owned data. Keeping the accepted grammar narrow
+    /// prevents paths, session identifiers, transcript references, and secret
+    /// material from entering the local continuity ledger.
+    private static func auditEvidenceID(_ value: String) throws -> String {
+        let canonical = try ContinuityValidation.requiredText(
+            value,
+            field: "auditEvidenceID",
+            maximumBytes: 256
+        )
+        guard canonical.hasPrefix("ev_"),
+              canonical.unicodeScalars.allSatisfy({ scalar in
+                  switch scalar.value {
+                  case 48 ... 57, 65 ... 90, 97 ... 122, 45, 46, 95:
+                      true
+                  default:
+                      false
+                  }
+              }) else {
+            throw ContinuityValidationError.invalidReconciliationEvidence
+        }
+
+        let terms = canonical.lowercased().split(whereSeparator: { ".-_".contains($0) })
+        let prohibitedTerms: Set<Substring> = [
+            "transcript", "session", "path", "file", "secret", "token", "password", "credential", "sk",
+        ]
+        guard prohibitedTerms.isDisjoint(with: terms) else {
+            throw ContinuityValidationError.invalidReconciliationEvidence
+        }
+        return canonical
+    }
+}
+
 public enum ContinuityValidationError: Error, Equatable, Sendable, CustomStringConvertible {
     case empty(field: String)
     case containsControlCharacters(field: String)
@@ -588,6 +692,7 @@ public enum ContinuityValidationError: Error, Equatable, Sendable, CustomStringC
     case negativeAttempt(Int)
     case negativeRevision(Int64)
     case invalidLeaseDuration(TimeInterval)
+    case invalidReconciliationEvidence
     case invalidSyncCompletion(state: ContinuitySyncState)
 
     public var description: String {
@@ -608,6 +713,8 @@ public enum ContinuityValidationError: Error, Equatable, Sendable, CustomStringC
             "Continuity revision cannot be negative (received \(revision))."
         case let .invalidLeaseDuration(duration):
             "Continuity writer lease duration must be finite and between 1 and 300 seconds (received \(duration))."
+        case .invalidReconciliationEvidence:
+            "Continuity audit evidence must be an opaque ev_-prefixed ledger identifier."
         case let .invalidSyncCompletion(state):
             "Continuity sync state \(state.rawValue) has an invalid completion timestamp."
         }

@@ -775,6 +775,356 @@ public actor SQLiteStore {
         try hardenDatabaseArtifacts()
     }
 
+    /// Acquires the local write permission for one continuity workstream.
+    /// This intentionally does not reuse sync-transaction rows: a provider's
+    /// repository execution and an external tracker sync have different
+    /// authority and completion lifecycles. Expired populated rows are never
+    /// silently taken over; they are atomically marked for reconciliation.
+    public func acquireContinuityWorkstreamWriterLease(
+        projectID: UUID,
+        workstreamID: UUID,
+        ownerID: UUID,
+        now: Date = Date(),
+        duration: TimeInterval = 60
+    ) throws -> ContinuityWorkstreamWriterLease? {
+        try validateContinuityLease(now: now, duration: duration)
+        let expiresAt = now.addingTimeInterval(duration)
+        let result: (lease: ContinuityWorkstreamWriterLease?, changed: Bool) = try inImmediateTransaction {
+            if try markExpiredContinuityWorkstreamWriterLeaseForReconciliation(
+                projectID: projectID,
+                workstreamID: workstreamID,
+                at: now
+            ) {
+                return (nil, true)
+            }
+
+            try update(
+                """
+                INSERT INTO continuity_workstream_writer_leases (
+                    project_id, workstream_id, owner_token, lease_expires_at,
+                    requires_reconciliation, reconciliation_reason, reconciliation_evidence,
+                    reconciled_at, revision
+                ) VALUES (?, ?, ?, ?, 0, NULL, NULL, NULL, 1)
+                ON CONFLICT(project_id, workstream_id) DO UPDATE SET
+                    owner_token = excluded.owner_token,
+                    lease_expires_at = excluded.lease_expires_at,
+                    revision = continuity_workstream_writer_leases.revision + 1
+                WHERE continuity_workstream_writer_leases.requires_reconciliation = 0
+                  AND continuity_workstream_writer_leases.owner_token IS NULL
+                """,
+                bindings: [
+                    .text(projectID.uuidString),
+                    .text(workstreamID.uuidString),
+                    .text(ownerID.uuidString),
+                    .double(expiresAt.timeIntervalSince1970),
+                ]
+            )
+            guard sqlite3_changes(database) == 1 else { return (nil, false) }
+            let revision = try continuityWorkstreamWriterLeaseRevision(
+                projectID: projectID,
+                workstreamID: workstreamID,
+                ownerID: ownerID,
+                expiresAt: expiresAt
+            )
+            let lease = try ContinuityWorkstreamWriterLease(
+                projectID: projectID,
+                workstreamID: workstreamID,
+                ownerID: ownerID,
+                expiresAt: expiresAt,
+                revision: revision
+            )
+            return (lease, true)
+        }
+        if result.changed { try hardenDatabaseArtifacts() }
+        return result.lease
+    }
+
+    /// Renews a workstream writer lease only while its current owner is still
+    /// valid. This is deliberately separate from acquisition so an expired
+    /// same-owner process cannot resurrect itself after a heartbeat gap.
+    public func renewContinuityWorkstreamWriterLease(
+        projectID: UUID,
+        workstreamID: UUID,
+        ownerID: UUID,
+        now: Date = Date(),
+        duration: TimeInterval = 60
+    ) throws -> ContinuityWorkstreamWriterLease? {
+        try validateContinuityLease(now: now, duration: duration)
+        let expiresAt = now.addingTimeInterval(duration)
+        let result: (lease: ContinuityWorkstreamWriterLease?, changed: Bool) = try inImmediateTransaction {
+            try update(
+                """
+                UPDATE continuity_workstream_writer_leases
+                SET lease_expires_at = ?, revision = revision + 1
+                WHERE project_id = ? AND workstream_id = ?
+                  AND requires_reconciliation = 0
+                  AND owner_token = ?
+                  AND lease_expires_at > ?
+                """,
+                bindings: [
+                    .double(expiresAt.timeIntervalSince1970),
+                    .text(projectID.uuidString),
+                    .text(workstreamID.uuidString),
+                    .text(ownerID.uuidString),
+                    .double(now.timeIntervalSince1970),
+                ]
+            )
+            if sqlite3_changes(database) == 1 {
+                let revision = try continuityWorkstreamWriterLeaseRevision(
+                    projectID: projectID,
+                    workstreamID: workstreamID,
+                    ownerID: ownerID,
+                    expiresAt: expiresAt
+                )
+                return (try ContinuityWorkstreamWriterLease(
+                    projectID: projectID,
+                    workstreamID: workstreamID,
+                    ownerID: ownerID,
+                    expiresAt: expiresAt,
+                    revision: revision
+                ), true)
+            }
+            return (nil, try markExpiredContinuityWorkstreamWriterLeaseForReconciliation(
+                projectID: projectID,
+                workstreamID: workstreamID,
+                at: now
+            ))
+        }
+        if result.changed { try hardenDatabaseArtifacts() }
+        return result.lease
+    }
+
+    @discardableResult
+    public func releaseContinuityWorkstreamWriterLease(
+        projectID: UUID,
+        workstreamID: UUID,
+        ownerID: UUID,
+        at timestamp: Date = Date()
+    ) throws -> Bool {
+        try validateContinuityDate(timestamp, field: "workstreamLeaseReleaseAt")
+        let result: (released: Bool, changed: Bool) = try inImmediateTransaction {
+            try update(
+                """
+                UPDATE continuity_workstream_writer_leases
+                SET owner_token = NULL,
+                    lease_expires_at = NULL,
+                    revision = revision + 1
+                WHERE project_id = ? AND workstream_id = ?
+                  AND requires_reconciliation = 0
+                  AND owner_token = ?
+                  AND lease_expires_at > ?
+                """,
+                bindings: [
+                    .text(projectID.uuidString),
+                    .text(workstreamID.uuidString),
+                    .text(ownerID.uuidString),
+                    .double(timestamp.timeIntervalSince1970),
+                ]
+            )
+            if sqlite3_changes(database) == 1 { return (true, true) }
+            return (false, try markExpiredContinuityWorkstreamWriterLeaseForReconciliation(
+                projectID: projectID,
+                workstreamID: workstreamID,
+                at: timestamp
+            ))
+        }
+        if result.changed { try hardenDatabaseArtifacts() }
+        return result.released
+    }
+
+    /// Durably blocks new writers after an ownership loss. The marker survives
+    /// process restart and can be cleared only through the explicit audited
+    /// reconciliation operation below.
+    @discardableResult
+    public func requireContinuityWorkstreamReconciliation(
+        projectID: UUID,
+        workstreamID: UUID,
+        reason: String,
+        at timestamp: Date = Date()
+    ) throws -> Bool {
+        try validateContinuityDate(timestamp, field: "workstreamReconciliationAt")
+        let boundedReason = try validatedWorkstreamReconciliationReason(reason)
+        try update(
+            """
+            INSERT INTO continuity_workstream_writer_leases (
+                project_id, workstream_id, owner_token, lease_expires_at,
+                requires_reconciliation, reconciliation_reason, reconciliation_evidence,
+                reconciled_at, revision
+            ) VALUES (?, ?, NULL, NULL, 1, ?, NULL, NULL, 1)
+            ON CONFLICT(project_id, workstream_id) DO UPDATE SET
+                requires_reconciliation = 1,
+                reconciliation_reason = excluded.reconciliation_reason,
+                reconciliation_evidence = NULL,
+                reconciled_at = NULL,
+                revision = continuity_workstream_writer_leases.revision + 1
+            """,
+            bindings: [
+                .text(projectID.uuidString),
+                .text(workstreamID.uuidString),
+                .text(boundedReason),
+            ]
+        )
+        let recorded = sqlite3_changes(database) == 1
+        if recorded { try hardenDatabaseArtifacts() }
+        return recorded
+    }
+
+    /// Clears a fail-closed workstream marker only after a caller has freshly
+    /// validated a portable capsule, the Git boundary, and audit evidence.
+    @discardableResult
+    public func reconcileContinuityWorkstreamWriterLease(
+        projectID: UUID,
+        workstreamID: UUID,
+        evidence: ContinuityWorkstreamReconciliationEvidence,
+        at timestamp: Date = Date()
+    ) throws -> Bool {
+        try validateContinuityDate(timestamp, field: "workstreamReconciledAt")
+        try update(
+            """
+            UPDATE continuity_workstream_writer_leases
+            SET owner_token = NULL,
+                lease_expires_at = NULL,
+                requires_reconciliation = 0,
+                reconciliation_reason = NULL,
+                reconciliation_evidence = ?,
+                reconciled_at = ?,
+                revision = revision + 1
+            WHERE project_id = ? AND workstream_id = ?
+              AND requires_reconciliation = 1
+              AND (owner_token IS NULL OR lease_expires_at <= ?)
+            """,
+            bindings: [
+                .text(evidence.storageValue),
+                .double(timestamp.timeIntervalSince1970),
+                .text(projectID.uuidString),
+                .text(workstreamID.uuidString),
+                .double(timestamp.timeIntervalSince1970),
+            ]
+        )
+        let reconciled = sqlite3_changes(database) == 1
+        if reconciled { try hardenDatabaseArtifacts() }
+        return reconciled
+    }
+
+    public func continuityWorkstreamRequiresReconciliation(
+        projectID: UUID,
+        workstreamID: UUID
+    ) throws -> Bool {
+        let statement = try prepare(
+            """
+            SELECT requires_reconciliation
+            FROM continuity_workstream_writer_leases
+            WHERE project_id = ? AND workstream_id = ?
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind([.text(projectID.uuidString), .text(workstreamID.uuidString)], to: statement)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            return sqlite3_column_int(statement, 0) != 0
+        case SQLITE_DONE:
+            return false
+        default:
+            throw sqliteError()
+        }
+    }
+
+    public func continuityWorkstreamWriterLeaseRevision(
+        projectID: UUID,
+        workstreamID: UUID
+    ) throws -> Int64? {
+        let statement = try prepare(
+            """
+            SELECT revision FROM continuity_workstream_writer_leases
+            WHERE project_id = ? AND workstream_id = ?
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind([.text(projectID.uuidString), .text(workstreamID.uuidString)], to: statement)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            return sqlite3_column_int64(statement, 0)
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw sqliteError()
+        }
+    }
+
+    /// Runs the lease transition under SQLite's cross-process write lock. The
+    /// actor serializes one store instance; BEGIN IMMEDIATE extends that safety
+    /// to another app process pointing at the same protected database.
+    private func inImmediateTransaction<T>(_ body: () throws -> T) throws -> T {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let value = try body()
+            try execute("COMMIT")
+            return value
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    /// Turns an expired populated lease into a durable fail-closed state. The
+    /// predicate is intentionally strict: a caller can never clear a valid
+    /// owner or overwrite a prior reconciliation requirement.
+    private func markExpiredContinuityWorkstreamWriterLeaseForReconciliation(
+        projectID: UUID,
+        workstreamID: UUID,
+        at timestamp: Date
+    ) throws -> Bool {
+        try update(
+            """
+            UPDATE continuity_workstream_writer_leases
+            SET owner_token = NULL,
+                lease_expires_at = NULL,
+                requires_reconciliation = 1,
+                reconciliation_reason = ?,
+                reconciliation_evidence = NULL,
+                reconciled_at = NULL,
+                revision = revision + 1
+            WHERE project_id = ? AND workstream_id = ?
+              AND requires_reconciliation = 0
+              AND owner_token IS NOT NULL
+              AND lease_expires_at <= ?
+            """,
+            bindings: [
+                .text("Writer lease expired before ownership could be verified. Explicit reconciliation is required."),
+                .text(projectID.uuidString),
+                .text(workstreamID.uuidString),
+                .double(timestamp.timeIntervalSince1970),
+            ]
+        )
+        return sqlite3_changes(database) == 1
+    }
+
+    private func continuityWorkstreamWriterLeaseRevision(
+        projectID: UUID,
+        workstreamID: UUID,
+        ownerID: UUID,
+        expiresAt: Date
+    ) throws -> Int64 {
+        let statement = try prepare(
+            """
+            SELECT revision FROM continuity_workstream_writer_leases
+            WHERE project_id = ? AND workstream_id = ?
+              AND owner_token = ? AND lease_expires_at = ?
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind([
+            .text(projectID.uuidString),
+            .text(workstreamID.uuidString),
+            .text(ownerID.uuidString),
+            .double(expiresAt.timeIntervalSince1970),
+        ], to: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw SQLiteStoreError.corruptRow("continuity workstream writer lease was lost before it could be read")
+        }
+        return sqlite3_column_int64(statement, 0)
+    }
+
     /// Acquires or renews an opaque writer lease using a single SQL compare-and-
     /// swap. A second process cannot take a non-expired lease owned by another
     /// writer, and no provider identity is used as the owner token.
@@ -1657,6 +2007,11 @@ public actor SQLiteStore {
             throw SQLiteStoreError.unsupportedSchemaVersion(currentVersion)
         }
 
+        // v4 introduced continuity tables. Workstream leases are an additive
+        // v4 repair and deliberately do not reinterpret existing sync rows.
+        try execute(Self.createContinuityWorkstreamWriterLeaseSchemaSQL, on: connection)
+        try ensureContinuityWorkstreamWriterLeaseColumns(on: connection)
+
         try setPermissions(0o600, for: databaseURL, allowMissing: false)
         try setPermissions(
             0o600,
@@ -1808,7 +2163,84 @@ public actor SQLiteStore {
     );
     CREATE INDEX continuity_sync_transactions_project_updated
         ON continuity_sync_transactions(project_id, updated_at DESC, created_at DESC, id ASC);
+    \(SQLiteStore.createContinuityWorkstreamWriterLeaseSchemaSQL)
     """
+
+    private static let createContinuityWorkstreamWriterLeaseSchemaSQL = """
+    CREATE TABLE IF NOT EXISTS continuity_workstream_writer_leases (
+        project_id TEXT NOT NULL
+            REFERENCES continuity_projects(id) ON DELETE CASCADE,
+        workstream_id TEXT NOT NULL
+            CHECK(length(CAST(workstream_id AS BLOB)) = 36),
+        owner_token TEXT
+            CHECK(owner_token IS NULL OR length(CAST(owner_token AS BLOB)) = 36),
+        lease_expires_at REAL,
+        requires_reconciliation INTEGER NOT NULL DEFAULT 0
+            CHECK(requires_reconciliation IN (0, 1)),
+        reconciliation_reason TEXT
+            CHECK(reconciliation_reason IS NULL OR length(CAST(reconciliation_reason AS BLOB)) <= 1024),
+        reconciliation_evidence TEXT
+            CHECK(reconciliation_evidence IS NULL OR length(CAST(reconciliation_evidence AS BLOB)) <= 512),
+        reconciled_at REAL,
+        revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+        PRIMARY KEY(project_id, workstream_id),
+        UNIQUE(workstream_id),
+        CHECK(
+            (owner_token IS NULL AND lease_expires_at IS NULL)
+            OR (owner_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        )
+    );
+    CREATE INDEX IF NOT EXISTS continuity_workstream_writer_leases_expiry
+        ON continuity_workstream_writer_leases(lease_expires_at, project_id, workstream_id);
+    """
+
+    private static func ensureContinuityWorkstreamWriterLeaseColumns(
+        on connection: OpaquePointer
+    ) throws {
+        let columns = try tableColumns("continuity_workstream_writer_leases", on: connection)
+        if !columns.contains("requires_reconciliation") {
+            try execute(
+                "ALTER TABLE continuity_workstream_writer_leases ADD COLUMN requires_reconciliation INTEGER NOT NULL DEFAULT 0 CHECK(requires_reconciliation IN (0, 1))",
+                on: connection
+            )
+        }
+        if !columns.contains("reconciliation_reason") {
+            try execute(
+                "ALTER TABLE continuity_workstream_writer_leases ADD COLUMN reconciliation_reason TEXT CHECK(reconciliation_reason IS NULL OR length(CAST(reconciliation_reason AS BLOB)) <= 1024)",
+                on: connection
+            )
+        }
+        if !columns.contains("reconciliation_evidence") {
+            try execute(
+                "ALTER TABLE continuity_workstream_writer_leases ADD COLUMN reconciliation_evidence TEXT CHECK(reconciliation_evidence IS NULL OR length(CAST(reconciliation_evidence AS BLOB)) <= 512)",
+                on: connection
+            )
+        }
+        if !columns.contains("reconciled_at") {
+            try execute(
+                "ALTER TABLE continuity_workstream_writer_leases ADD COLUMN reconciled_at REAL",
+                on: connection
+            )
+        }
+    }
+
+    private static func tableColumns(_ table: String, on connection: OpaquePointer) throws -> Set<String> {
+        var statement: OpaquePointer?
+        let sql = "PRAGMA table_info(\(table))"
+        let result = sqlite3_prepare_v2(connection, sql, -1, &statement, nil)
+        guard result == SQLITE_OK, let statement else {
+            throw sqliteError(for: connection, code: result)
+        }
+        defer { sqlite3_finalize(statement) }
+        var columns: Set<String> = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let text = sqlite3_column_text(statement, 1) else {
+                throw SQLiteStoreError.corruptRow("continuity workstream lease column name is null")
+            }
+            columns.insert(String(cString: text))
+        }
+        return columns
+    }
 
     private static func execute(_ sql: String, on connection: OpaquePointer) throws {
         var errorMessage: UnsafeMutablePointer<CChar>?
@@ -1982,6 +2414,21 @@ public actor SQLiteStore {
                 maximumBytes: Self.maximumMessageBytes
             )
         }
+    }
+
+    private func validatedWorkstreamReconciliationReason(_ reason: String) throws -> String {
+        let canonical = reason.precomposedStringWithCanonicalMapping
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !canonical.isEmpty,
+              canonical.utf8.count <= 1_024,
+              !canonical.unicodeScalars.contains(where: {
+                  CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw SQLiteStoreError.invalidContinuityRelationship(
+                "a reconciliation reason must be nonempty, printable, and at most 1024 bytes"
+            )
+        }
+        return canonical
     }
 
     private func conversationBindings(_ conversation: Conversation) throws -> [Binding] {
